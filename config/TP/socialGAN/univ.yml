@@ -1,0 +1,5 @@
+MODEL:
+  TYPE: socialGAN
+
+DATA:
+  DATASET_NAME: "univ"

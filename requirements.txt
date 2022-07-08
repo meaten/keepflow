@@ -1,0 +1,14 @@
+yacs
+tqdm
+numpy
+pillow
+scipy
+scikit-image
+torch
+torchvision
+kornia
+wandb
+torchfile
+
+matplotlib
+seaborn

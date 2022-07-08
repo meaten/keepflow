@@ -1,0 +1,8 @@
+MODEL:
+  TYPE: GT
+
+DATA:
+  DATASET_NAME: "zara1"
+
+SOLVER:
+  USE_SCHEDULER: True

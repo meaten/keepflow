@@ -1,0 +1,5 @@
+MODEL:
+  TYPE: GT
+
+DATA:
+  DATASET_NAME: "zara2"

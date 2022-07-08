@@ -1,0 +1,5 @@
+MODEL:
+  TYPE: socialLSTM
+
+DATA:
+  DATASET_NAME: "eth"
