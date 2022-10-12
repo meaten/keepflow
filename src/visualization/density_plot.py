@@ -1,9 +1,13 @@
 from pathlib import Path
+import matplotlib
 import matplotlib.pyplot as plt
 import numpy as np
  
 def plot_density(x: np.array, y: np.array, p: np.array, path: Path) -> None:
-    plt.pcolormesh(x, y, p.reshape(x.shape), shading='auto', cmap=plt.cm.get_cmap("jet"))
+    plt.pcolormesh(x, y, p.reshape(x.shape),
+                   shading='auto',
+                   cmap=plt.cm.get_cmap("jet"),
+                   norm=matplotlib.colors.Normalize())
     plt.axis('off')
     plt.savefig(path, bbox_inches='tight')
     plt.close()

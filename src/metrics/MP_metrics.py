@@ -14,7 +14,7 @@ def MP_metrics(dict_list: List) -> Dict:
         pred_expmap = deepcopy(data_dict["gt_all"])
         dim_used = data_dict["dim_used"].cpu().numpy().astype(int)
         
-        pred_expmap[:, :, dim_used] = data_dict["pred"][:, :, :54]
+        pred_expmap[:, :, dim_used] = data_dict[("pred", 0)][:, :, :54]
         pred_expmap = pred_expmap * data_dict["std"] + data_dict["mean"]
         
         targ_expmap = targ_expmap.transpose(1, 0)

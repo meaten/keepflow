@@ -15,7 +15,7 @@ from utils import optimizer_to_cuda
 
 
 class ARFlow(nn.Module):
-    def __init__(self, cfg: CfgNode, load=False) -> None:
+    def __init__(self, cfg: CfgNode) -> None:
         super(ARFlow, self).__init__()
         
         self.output_path = Path(cfg.OUTPUT_DIR)
@@ -23,7 +23,10 @@ class ARFlow(nn.Module):
         self.obs_len = cfg.DATA.OBSERVE_LENGTH
         self.pred_len = cfg.DATA.PREDICT_LENGTH
         
-        self.input_size = 2
+        self.feature_dim = 2
+        conditioning_length = 16
+        self.pe_dim = 16
+        self.input_size = self.feature_dim + self.pe_dim
         self.d_model = 16
         num_heads = 4
         num_encoder_layers = 3
@@ -37,7 +40,7 @@ class ARFlow(nn.Module):
         n_hidden = 2
         hidden_size = 64
         dequantize = False
-        self.scaling = False
+        self.scaling = True
         prediction_length = self.pred_len
         
         self.encoder_input = nn.Linear(self.input_size, self.d_model)
@@ -63,24 +66,19 @@ class ARFlow(nn.Module):
             n_blocks=n_blocks,
             n_hidden=n_hidden,
             hidden_size=hidden_size,
-            cond_label_size=self.d_model,
+            cond_label_size=conditioning_length,
         )
         self.dequantize = dequantize
         
+        self.dist_args_proj = nn.Linear(self.d_model, conditioning_length)
+        
         position = torch.arange(self.obs_len + self.pred_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, self.d_model, 2) * (-math.log(10000.0) / self.d_model))
-        self.pe = torch.zeros(self.obs_len + self.pred_len, 1, self.d_model)
+        div_term = torch.exp(torch.arange(0, self.pe_dim, 2) * (-math.log(10000.0) / self.pe_dim))
+        self.pe = torch.zeros(self.obs_len + self.pred_len, 1, self.pe_dim)
         self.pe[:, 0, 0::2] = torch.sin(position * div_term)
         self.pe[:, 0, 1::2] = torch.cos(position * div_term)
         
         self.pe = self.pe.cuda()
-
-        #self.proj_dist_args = self.distr_output.get_args_proj(d_model)
-
-        # self.embed_dim = 1        
-        # self.embed = nn.Embedding(
-        #     num_embeddings=self.target_dim, embedding_dim=self.embed_dim
-        # )
 
         if self.scaling:
             self.scaler = MeanScaler(keepdim=True)
@@ -96,88 +94,81 @@ class ARFlow(nn.Module):
         self.optimizer = optim.Adam(self.parameters(), 5e-4)
         self.optimizers = [self.optimizer]
 
-        if load:
-            self.load()
-
     def predict(self, data_dict: Dict) -> Dict:
         inputs = torch.cat([data_dict['obs'], data_dict['gt']])
 
         enc_inputs = inputs[: self.obs_len, ...]
-        dec_inputs = inputs[self.pred_len-1 : -1, ...]
+        dec_inputs = enc_inputs[-1][None]
+        
+        _, scale = self.scaler(enc_inputs)
+        if self.scaling:
+            self.flow.scale = scale
         
         enc_pe = self.pe[: self.obs_len, ...]
-        dec_pe = self.pe[self.pred_len-1 : -1, ...]
+        dec_pe = self.pe[self.obs_len-1 : -1, ...]
         
-        enc_out = self.transformer.encoder(self.encoder_input(enc_inputs) + enc_pe)
+        enc_inputs = torch.cat([enc_inputs, enc_pe.tile(1, enc_inputs.shape[1], 1)], dim=-1)
         
-        future_samples = []
+        enc_out = self.transformer.encoder(self.encoder_input(enc_inputs))
+        
+        sample = dec_inputs
         prob_map = []
-        
-        sample = dec_inputs[0][None, ...]
-
-        num_grid = 200
-        max_val = data_dict["max"]
-        min_val = data_dict["min"]
-        xs = torch.linspace(min_val[0], max_val[0], steps=num_grid).cuda()
-        ys = torch.linspace(min_val[1], max_val[1], steps=num_grid).cuda()
-        
-        batch_size = data_dict["obs"].shape[1]
-        x, y = torch.meshgrid(xs, ys, indexing='ij')
-        grid = torch.cat([x.flatten()[..., None], y.flatten()[..., None]], dim=1)
-        grid = grid[None, ...].expand(batch_size, -1, -1)
-        grid_input = grid.reshape(1, -1, self.input_size)
+        preds = []
+        current_dec_inputs = []
         
         for k in range(self.pred_len):
+            current_dec_inputs.append(torch.cat([sample, dec_pe[k][None]], dim=-1))
             dec_output = self.transformer.decoder(
-                self.decoder_input(sample) + dec_pe[k],
-                enc_out)
+                self.decoder_input(torch.cat(current_dec_inputs, dim=0)),
+                enc_out)[-1][None]
+            sample_num = 10000
+            dist_args = self.dist_args_proj(dec_output).expand(sample_num, -1, -1)
+        
+            pos, log_prob = self.flow.sample_with_log_prob(cond=dist_args)
+            pos_log_prob = torch.cat([pos, torch.exp(log_prob)[..., None]], dim=-1)
+            prob_map.append(pos_log_prob[None, ...])
+            sample = pos[-1:]
+            preds.append(sample)
             
-            sample = self.flow.sample(cond=dec_output)
-            future_samples.append(sample)
-            dec_output = dec_output.expand((num_grid ** 2), -1, -1).transpose(1, 0).reshape(1, -1, self.d_model)
-            log_prob = self.flow.log_prob(grid_input, dec_output).reshape(batch_size, -1)
-            #sample = torch.stack([grid[i, argmax] for i, argmax in enumerate(torch.argmax(log_prob, dim=1).cpu().numpy())])[None, ...]
-            prob_map.append(torch.cat([grid, torch.exp(log_prob)[..., None]], dim=-1)[None, ...])
-            
-        samples = torch.cat(future_samples, dim=0)
+        preds = torch.cat(preds, dim=0)
         prob_map = torch.cat(prob_map, dim=0)
-        data_dict["pred"] = samples
-        data_dict["prob"] = prob_map
+        data_dict[("pred", 0)] = preds
+        data_dict[("prob", 0)] = prob_map
         return data_dict
 
     def update(self, data_dict: Dict) -> Dict:
-        # TODO
-        # inference(predict): autoregressive
-        # training(update): parallel
-        # time feature embedding
-        # Scaler and Flow model
-        # absolute traj probability 
-    
         inputs = torch.cat([data_dict['obs'], data_dict['gt']])
 
         enc_inputs = inputs[: self.obs_len, ...]
-        dec_inputs = inputs[self.pred_len-1 : -1, ...]
+        dec_inputs = inputs[self.obs_len-1 : -1, ...]
+        
+        _, scale = self.scaler(enc_inputs)
+        if self.scaling:
+            self.flow.scale = scale
         
         enc_pe = self.pe[: self.obs_len, ...]
-        dec_pe = self.pe[self.pred_len-1 : -1, ...]
+        dec_pe = self.pe[self.obs_len-1 : -1, ...]
+        
+        enc_inputs = torch.cat([enc_inputs, enc_pe.tile(1, enc_inputs.shape[1], 1)], dim=-1)
+        dec_inputs = torch.cat([dec_inputs, dec_pe.tile(1, dec_inputs.shape[1], 1)], dim=-1)
 
         enc_out = self.transformer.encoder(
-            self.encoder_input(enc_inputs) + enc_pe
+            self.encoder_input(enc_inputs)
         )
-
+        
         dec_output = self.transformer.decoder(
-            self.decoder_input(dec_inputs) + dec_pe,
+            self.decoder_input(dec_inputs),
             enc_out,
             tgt_mask=self.tgt_mask,
         )
-
-        if self.scaling:
-            self.flow.scale = scale
-
-        #distr_args = self.distr_args(decoder_output=dec_output.permute(1, 0, 2))
-        loss = -self.flow.log_prob(data_dict['gt'] + torch.rand_like(data_dict['gt']) if self.dequantize else data_dict['gt'],
-                                   dec_output).unsqueeze(-1)
         
+        dist_args = self.dist_args_proj(dec_output)
+        
+        gt = data_dict['gt']
+        if self.dequantize:
+            gt += torch.rand_like(data_dict['gt'])
+        
+        loss = -self.flow.log_prob(gt, dist_args)
         loss = loss.mean()
         
         self.optimizer.zero_grad()
@@ -186,18 +177,25 @@ class ARFlow(nn.Module):
 
         return {'loss': loss.mean().item()}
     
-    def save(self, path: Path=None):
+    def save(self, epoch: int = 0, path: Path=None) -> None:
         if path is None:
             path = self.output_path / "ckpt.pt"
             
         ckpt = {
+            'epoch': epoch,
             'state': self.state_dict(),
             'optim_state': self.optimizer.state_dict(),
         }
 
         torch.save(ckpt, path)
+        
+    def check_saved_path(self, path: Path = None) -> bool:
+        if path is None:
+            path = self.output_path / "ckpt.pt"        
+        
+        return path.exists()
 
-    def load(self, path: Path=None):
+    def load(self, path: Path=None) -> int:
         if path is None:
             path = self.output_path / "ckpt.pt"
         
@@ -205,10 +203,10 @@ class ARFlow(nn.Module):
         self.load_state_dict(ckpt['state'])
 
         self.optimizer.load_state_dict(ckpt['optim_state'])
-
         optimizer_to_cuda(self.optimizer)
     
-
+        return ckpt['epoch']
+    
 
 def create_masks(
     input_size, hidden_size, n_hidden, input_order="sequential", input_degrees=None
@@ -309,7 +307,7 @@ class BatchNorm(nn.Module):
         # compute normalized input (cf original batch norm paper algo 1)
         x_hat = (x - mean) / torch.sqrt(var + self.eps)
         y = self.log_gamma.exp() * x_hat + self.beta
-
+        
         # compute log_abs_det_jacobian (cf RealNVP paper)
         log_abs_det_jacobian = self.log_gamma - 0.5 * torch.log(var + self.eps)
         #        print('in sum log var {:6.3f} ; out sum log var {:6.3f}; sum log det {:8.3f}; mean log_gamma {:5.3f}; mean beta {:5.3f}'.format(
@@ -368,7 +366,7 @@ class LinearMaskedCoupling(nn.Module):
         t = self.t_net(mx if y is None else torch.cat([y, mx], dim=-1)) * (
             1 - self.mask
         )
-
+        
         # cf RealNVP eq 8 where u corresponds to x (here we're modeling u)
         log_s = torch.tanh(s) * (1 - self.mask)
         u = x * torch.exp(log_s) + t
@@ -391,7 +389,7 @@ class LinearMaskedCoupling(nn.Module):
         t = self.t_net(mu if y is None else torch.cat([y, mu], dim=-1)) * (
             1 - self.mask
         )
-
+        
         log_s = torch.tanh(s) * (1 - self.mask)
         x = (u - t) * torch.exp(-log_s)
         # x = u * torch.exp(log_s) + t
@@ -553,6 +551,16 @@ class Flow(nn.Module):
         u = self.base_dist.sample(shape)
         sample, _ = self.inverse(u, cond)
         return sample
+    
+    def sample_with_log_prob(self, sample_shape=torch.Size(), cond=None):
+        if cond is not None:
+            shape = cond.shape[:-1]
+        else:
+            shape = sample_shape
+
+        u = self.base_dist.sample(shape)
+        sample, sum_log_abs_det_jacobians = self.inverse(u, cond)
+        return sample, torch.sum(self.base_dist.log_prob(u) + sum_log_abs_det_jacobians, dim=-1)
 
 
 class RealNVP(Flow):
@@ -618,45 +626,23 @@ class MAF(Flow):
 
 
 class Scaler(ABC, nn.Module):
-    def __init__(self, keepdim: bool = False, time_first: bool = True):
+    def __init__(self, keepdim: bool = False):
         super().__init__()
         self.keepdim = keepdim
-        self.time_first = time_first
 
     @abstractmethod
     def compute_scale(
-        self, data: torch.Tensor, observed_indicator: torch.Tensor
+        self, data: torch.Tensor
     ) -> torch.Tensor:
         pass
 
     def forward(
-        self, data: torch.Tensor, observed_indicator: torch.Tensor
+        self, data: torch.Tensor
     ) -> Tuple[torch.Tensor, torch.Tensor]:
-        """
-        Parameters
-        ----------
-        data
-            tensor of shape (N, T, C) if ``time_first == True`` or (N, C, T)
-            if ``time_first == False`` containing the data to be scaled
-        observed_indicator
-            observed_indicator: binary tensor with the same shape as
-            ``data``, that has 1 in correspondence of observed data points,
-            and 0 in correspondence of missing data points.
-        Returns
-        -------
-        Tensor
-            Tensor containing the "scaled" data, shape: (N, T, C) or (N, C, T).
-        Tensor
-            Tensor containing the scale, of shape (N, C) if ``keepdim == False``,
-            and shape (N, 1, C) or (N, C, 1) if ``keepdim == True``.
-        """
 
-        scale = self.compute_scale(data, observed_indicator)
+        scale = self.compute_scale(data)
 
-        if self.time_first:
-            dim = 1
-        else:
-            dim = 2
+        dim = 0
         if self.keepdim:
             scale = scale.unsqueeze(dim=dim)
             return data / scale, scale
@@ -682,15 +668,13 @@ class MeanScaler(Scaler):
         self.register_buffer("minimum_scale", torch.tensor(minimum_scale))
 
     def compute_scale(
-        self, data: torch.Tensor, observed_indicator: torch.Tensor
+        self, data: torch.Tensor
     ) -> torch.Tensor:
 
-        if self.time_first:
-            dim = 1
-        else:
-            dim = 2
+        dim = 0
 
         # these will have shape (N, C)
+        observed_indicator = torch.ones_like(data)
         num_observed = observed_indicator.sum(dim=dim)
         sum_observed = (data.abs() * observed_indicator).sum(dim=dim)
 
@@ -724,12 +708,9 @@ class NOPScaler(Scaler):
         super().__init__(*args, **kwargs)
 
     def compute_scale(
-        self, data: torch.Tensor, observed_indicator: torch.Tensor
+        self, data: torch.Tensor
     ) -> torch.Tensor:
-        if self.time_first:
-            dim = 1
-        else:
-            dim = 2
+        dim = 0
         return torch.ones_like(data).mean(dim=dim)
     
 

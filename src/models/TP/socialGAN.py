@@ -19,7 +19,7 @@ from models.TP.socialLSTM import (
 
 
 class socialGAN(nn.Module):
-    def __init__(self, cfg: CfgNode, load=False) -> None:
+    def __init__(self, cfg: CfgNode) -> None:
         super(socialGAN, self).__init__()
 
         self.output_path = Path(cfg.OUTPUT_DIR)
@@ -75,9 +75,6 @@ class socialGAN(nn.Module):
         self.clipping_threshold_d = 0
         self.l2_loss_weight = 1.0
 
-        if load:
-            self.load()
-
     def forward(self, data_dict: Dict) -> Tuple[torch.Tensor, Dict]:
         return super().forward(data_dict)
 
@@ -85,13 +82,17 @@ class socialGAN(nn.Module):
         data_dict = self.g.predict(data_dict)
         return data_dict
 
+    def predict_from_new_obs(self, data_dict: Dict, time_step: int) -> Dict:
+        # TODO: need to implement the density estimation & update
+        return data_dict
+
     def update(self, data_dict: Dict) -> Dict:
         for _ in range(self.d_step):
             data_dict = self.predict(data_dict)
             traj_real = torch.cat([data_dict["obs"], data_dict["gt"]], dim=0)
             traj_real_rel = torch.cat([data_dict["obs_rel"], data_dict["gt_rel"]], dim=0)
-            traj_fake = torch.cat([data_dict["obs"], data_dict["pred"]], dim=0)
-            traj_fake_rel = torch.cat([data_dict["obs_rel"], data_dict["pred_rel"]], dim=0)
+            traj_fake = torch.cat([data_dict["obs"], data_dict[("pred", 0)]], dim=0)
+            traj_fake_rel = torch.cat([data_dict["obs_rel"], data_dict[("pred_rel", 0)]], dim=0)
 
             scores_fake = self.d(traj_fake, traj_fake_rel, data_dict["seq_start_end"])
             scores_real = self.d(traj_real, traj_real_rel, data_dict["seq_start_end"])
@@ -113,7 +114,7 @@ class socialGAN(nn.Module):
 
             if self.l2_loss_weight > 0:
                 g_l2_loss_rel.append(self.l2_loss_weight * l2_loss(
-                    data_dict["pred_rel"],
+                    data_dict[("pred_rel", 0)],
                     data_dict["gt_rel"],
                     loss_mask,
                     mode='raw'))
@@ -129,8 +130,8 @@ class socialGAN(nn.Module):
                 g_l2_loss_sum_rel += _g_l2_loss_rel
             g_loss += g_l2_loss_sum_rel
 
-        traj_fake = torch.cat([data_dict["obs"], data_dict["pred"]], dim=0)
-        traj_fake_rel = torch.cat([data_dict["obs_rel"], data_dict["pred_rel"]], dim=0)
+        traj_fake = torch.cat([data_dict["obs"], data_dict[("pred", 0)]], dim=0)
+        traj_fake_rel = torch.cat([data_dict["obs_rel"], data_dict[("pred_rel", 0)]], dim=0)
 
         scores_fake = self.d(traj_fake, traj_fake_rel, data_dict["seq_start_end"])
         discriminator_loss = self.g_loss_fn(scores_fake)
@@ -147,11 +148,12 @@ class socialGAN(nn.Module):
 
         return {"d_loss": d_loss.item(), "g_loss": g_loss.item()}
 
-    def save(self, path: Path=None):
+    def save(self, epoch: int = 0, path: Path=None) -> None:
         if path is None:
             path = self.output_path / "ckpt.pt"
             
         ckpt = {
+            'epoch': epoch,
             'g_state': self.g.state_dict(),
             'd_state': self.d.state_dict(),
             'g_optim_state': self.optimizer_g.state_dict(),
@@ -159,8 +161,14 @@ class socialGAN(nn.Module):
         }
 
         torch.save(ckpt, path)
+        
+    def check_saved_path(self, path: Path = None) -> bool:
+        if path is None:
+            path = self.output_path / "ckpt.pt"        
+        
+        return path.exists()
 
-    def load(self, path: Path=None):
+    def load(self, path: Path=None) -> int:
         if path is None:
             path = self.output_path / "ckpt.pt"
         
@@ -176,3 +184,5 @@ class socialGAN(nn.Module):
             optimizer_to_cuda(self.optimizer_d)
         except KeyError:
             print("skip loading discriminator model weights")
+
+        return ckpt["epoch"]

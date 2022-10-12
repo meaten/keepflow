@@ -29,6 +29,13 @@ def unified_loader(cfg: CfgNode, rand=True, split="train") -> DataLoader:
                 obs_len=cfg.DATA.OBSERVE_LENGTH,
                 pred_len=cfg.DATA.PREDICT_LENGTH
             )
+        elif cfg.DATA.DATASET_NAME == "simcross":
+            from data.TP.trajectories import SimulatedCrossTrajectory
+            dataset = SimulatedCrossTrajectory(
+                num_data=1000 if split == "train" else 10,
+                obs_len=cfg.DATA.OBSERVE_LENGTH,
+                pred_len=cfg.DATA.PREDICT_LENGTH
+            )
             
     # only train, test
     elif cfg.DATA.TASK == "VP":
@@ -104,8 +111,7 @@ def unified_loader(cfg: CfgNode, rand=True, split="train") -> DataLoader:
         from data.MP.h36motion import seq_collate
     collate_fn = seq_collate
     
-
-    batch_size = cfg.DATA.BATCH_SIZE if not split == "test" else cfg.DATA.BATCH_SIZE_TEST
+    batch_size = cfg.DATA.BATCH_SIZE if split != "test" else 1        
     loader = DataLoader(
         dataset,
         batch_size=batch_size,

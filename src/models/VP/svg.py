@@ -8,7 +8,7 @@ from utils import optimizer_to_cuda
 
 
 class SVG(nn.Module):
-    def __init__(self, cfg: CfgNode, load: bool=False) -> None:
+    def __init__(self, cfg: CfgNode) -> None:
         super(SVG, self).__init__()
 
         self.obs_len = cfg.DATA.OBSERVE_LENGTH
@@ -71,9 +71,6 @@ class SVG(nn.Module):
         self.mse_loss = nn.MSELoss()
 
         self.last_frame_skip = False
-
-        if load:
-            self.load()
 
     def update(self, data_dict):
         self.frame_predictor.zero_grad()
@@ -154,11 +151,12 @@ class SVG(nn.Module):
         
         return data_dict
 
-    def save(self, path: Path=None):
+    def save(self, epoch: int = 0, path: Path=None) -> None:
         if path is None:
             path = self.output_path / "ckpt.pt"
             
         ckpt = {
+            'epoch': epoch,
             'frame_predictor_state': self.frame_predictor.state_dict(),
             'prior_state': self.prior.state_dict(),
             'posterior_state': self.posterior.state_dict(),
@@ -172,8 +170,14 @@ class SVG(nn.Module):
         }
 
         torch.save(ckpt, path / "ckpt.pt")
+        
+    def check_saved_path(self, path: Path = None) -> bool:
+        if path is None:
+            path = self.output_path / "ckpt.pt"        
+        
+        return path.exists()
 
-    def load(self, path: Path=None):
+    def load(self, path: Path=None) -> int:
         if path is None:
             path = self.output_path / "ckpt.pt"
         
@@ -198,6 +202,8 @@ class SVG(nn.Module):
             optimizer_to_cuda(self.decoder_optimizer)
         except KeyError:
             pass
+        
+        return ckpt['epoch']
 
 class lstm(nn.Module):
     def __init__(self, input_size, output_size, hidden_size, n_layers):

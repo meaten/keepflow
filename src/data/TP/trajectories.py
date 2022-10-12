@@ -187,6 +187,8 @@ class TrajectoryDataset(Dataset):
         
         self.max = np.max(seq_list, axis=(0,2))
         self.min = np.min(seq_list, axis=(0,2))
+        self.mean = torch.from_numpy(np.mean(seq_list, axis=(0,2))).to(dtype=torch.float32)
+        self.std = torch.from_numpy(np.std(seq_list, axis=(0,2))).to(dtype=torch.float32)
         
     def __len__(self):
         return self.num_seq
@@ -208,7 +210,8 @@ class SimulatedForkTrajectory(Dataset):
     """Dataloder for the Trajectory datasets"""
     def __init__(
         self, num_data, obs_len=8, pred_len=12, threshold=0.002,
-        min_ped=1, delim='\t'
+        min_ped=1, delim='\t',
+        stochastic=True
     ):
         """
         Args:
@@ -228,6 +231,7 @@ class SimulatedForkTrajectory(Dataset):
         self.theta = np.pi / 3
         self.sigma = 0.5
         self.threshold = threshold
+        self.stochastic = stochastic
         
         self.traj = []
         for sgn in [1, -1]:
@@ -243,20 +247,28 @@ class SimulatedForkTrajectory(Dataset):
             traj = torch.cat([traj_flat, traj_ramp], dim=1)
     
             self.traj.append(traj)
-            
-        self.max = torch.max(torch.cat(self.traj, dim=1), dim=1).values
-        self.min = torch.min(torch.cat(self.traj, dim=1), dim=1).values
+        
+        traj_cat = torch.cat(self.traj, dim=1)
+        self.max = torch.max(traj_cat, dim=1).values
+        self.min = torch.min(traj_cat, dim=1).values
+        self.mean = torch.mean(traj_cat, dim=1)
+        self.std = torch.std(traj_cat, dim=1)
         
     def __len__(self):
         return self.num_data
 
     def __getitem__(self, index):
-        traj = deepcopy(self.traj[np.random.randint(2)])
+        if self.stochastic:
+            i = np.random.randint(2)
+        else:
+            i = 0
         
+        traj = deepcopy(self.traj[i])
         traj += torch.normal(mean=torch.zeros_like(traj), std=torch.ones_like(traj) * self.sigma)
         
         traj_rel = traj[:, 1:] - traj[:, :-1]
         traj = traj[:, 1:]
+        
         #non_linear = poly_fit(traj, self.pred_len, self.threshold)
         non_linear = torch.zeros([1, 1])
         loss_mask = torch.ones([1, self.obs_len + self.pred_len])
@@ -269,5 +281,83 @@ class SimulatedForkTrajectory(Dataset):
         ]
         return out
 
+
+class SimulatedCrossTrajectory(Dataset):
+    """Dataloder for the Trajectory datasets"""
+    def __init__(
+        self, num_data, obs_len=8, pred_len=12, threshold=0.002,
+        min_ped=1, delim='\t',
+        stochastic=True
+    ):
+        """
+        Args:
+        - obs_len: Number of time-steps in input trajectories
+        - pred_len: Number of time-steps in output trajectories
+        - skip: Number of frames to skip while making the dataset
+        - threshold: Minimum error to be considered for non linear traj
+        when using a linear predictor
+        - min_ped: Minimum number of pedestrians that should be in a seqeunce
+        - delim: Delimiter in the dataset files
+        """
+        self.num_data = num_data
+        self.obs_len = obs_len
+        self.pred_len = pred_len
+        self.seq_len = self.obs_len + self.pred_len
+        self.delim = delim
+        self.theta = np.pi / 3
+        self.sigma = 0.5
+        self.threshold = threshold
+        self.stochastic = stochastic
+        
+        self.traj = []
+        for sgn in [1, -1]:
+            traj_flat_x = torch.arange(-self.obs_len-1., 0., 1., dtype=torch.float)
+            traj_flat_y = torch.zeros_like(traj_flat_x, dtype=torch.float)
+            traj_flat = torch.cat([traj_flat_x[None, :], traj_flat_y[None, :]], dim=0)
+            
+            dist = torch.arange(1., self.pred_len+1., 1., dtype=torch.float)
+            traj_ramp_x = dist * np.cos(sgn * self.theta, dtype=np.float32)
+            dist = torch.cat([torch.arange(1., 3., 1., dtype=torch.float),
+                              torch.arange(2., -self.pred_len+4., -1., dtype=torch.float)])
+            traj_ramp_y = dist * np.sin(sgn * self.theta, dtype=np.float32)
+            traj_ramp = torch.cat([traj_ramp_x[None, :], traj_ramp_y[None, :]], dim=0)
+            
+            traj = torch.cat([traj_flat, traj_ramp], dim=1)
+    
+            #traj = torch.nn.functional.pad(traj, (0,1), mode='replicate')[:, 1:]
+            self.traj.append(traj)
+        
+        traj_cat = torch.cat(self.traj, dim=1)
+        self.max = torch.max(traj_cat, dim=1).values
+        self.min = torch.min(traj_cat, dim=1).values
+        self.mean = torch.mean(traj_cat, dim=1)
+        self.std = torch.std(traj_cat, dim=1)
+        
+    def __len__(self):
+        return self.num_data
+
+    def __getitem__(self, index):
+        if self.stochastic:
+            i = np.random.randint(2)
+        else:
+            i = 0
+        
+        traj = deepcopy(self.traj[i])
+        traj += torch.normal(mean=torch.zeros_like(traj), std=torch.ones_like(traj) * self.sigma)
+        
+        traj_rel = traj[:, 1:] - traj[:, :-1]
+        traj = traj[:, 1:]
+        
+        #non_linear = poly_fit(traj, self.pred_len, self.threshold)
+        non_linear = torch.zeros([1, 1])
+        loss_mask = torch.ones([1, self.obs_len + self.pred_len])
+        
+        out = [
+            index,
+            traj[:, :self.obs_len][None, :, :], traj[:, self.obs_len:][None, :, :],
+            traj_rel[:, :self.obs_len][None, :, :], traj_rel[:, self.obs_len:][None, :, :],
+            non_linear, loss_mask, self.max, self.min
+        ]
+        return out
 
     

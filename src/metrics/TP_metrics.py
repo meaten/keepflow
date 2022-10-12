@@ -4,8 +4,8 @@ from typing import List, Dict
 def TP_metrics(dict_list: List) -> Dict:
     ade, fde = [], []
     for data_dict in dict_list:
-        ade.append(displacement_error(data_dict["pred"], data_dict["gt"], mode='raw'))
-        fde.append(final_displacement_error(data_dict["pred"][-1], data_dict["gt"][-1], mode='raw'))
+        ade.append(displacement_error(data_dict[("pred", 0)], data_dict["gt"], mode='raw'))
+        fde.append(final_displacement_error(data_dict[("pred", 0)][-1], data_dict["gt"][-1], mode='raw'))
     total_traj = data_dict["seq_start_end"][-1][-1]
     ade = evaluate_helper(ade, data_dict["seq_start_end"]) 
     fde = evaluate_helper(fde, data_dict["seq_start_end"]) 

@@ -6,6 +6,7 @@ import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 
+from utils import optimizer_to_cuda
 
 class Seq2SeqModel(nn.Module):
     """Sequence-to-sequence model for human motion prediction"""
@@ -14,8 +15,7 @@ class Seq2SeqModel(nn.Module):
                  cfg,
                  number_of_actions=15,
                  one_hot=True,
-                 dropout=0.0,
-                 load=False):
+                 dropout=0.0):
 
         super(Seq2SeqModel, self).__init__()
 
@@ -45,8 +45,6 @@ class Seq2SeqModel(nn.Module):
         self.optimizers = [self.optimizer]
 
         self.output_path = Path(cfg.OUTPUT_DIR)
-        if load:
-            self.load()
 
     def predict(self, data_dict: Dict) -> Dict:
         encoder_inputs = data_dict["obs"]
@@ -82,7 +80,7 @@ class Seq2SeqModel(nn.Module):
                 prev = output
 
         outputs = torch.cat(outputs, 0)
-        data_dict["pred"] = outputs
+        data_dict[("pred", 0)] = outputs
         return data_dict
 
     def update(self, data_dict: Dict) -> Dict:
@@ -94,18 +92,25 @@ class Seq2SeqModel(nn.Module):
 
         return {"l1": loss.item()}
 
-    def save(self, path: Path=None):
+    def save(self, epoch: int = 0, path: Path=None) -> None:
         if path is None:
             path = self.output_path / "ckpt.pt"
             
         ckpt = {
+            'epoch': epoch,
             'lstm_state': self.state_dict(),
             'lstm_optim_state': self.optimizer.state_dict(),
         }
 
         torch.save(ckpt, path)
+        
+    def check_saved_path(self, path: Path = None) -> bool:
+        if path is None:
+            path = self.output_path / "ckpt.pt"        
+        
+        return path.exists()
 
-    def load(self, path: Path=None):
+    def load(self, path: Path=None) -> int:
         if path is None:
             path = self.output_path / "ckpt.pt"
         
@@ -113,3 +118,6 @@ class Seq2SeqModel(nn.Module):
         self.load_state_dict(ckpt['lstm_state'])
 
         self.optimizer.load_state_dict(ckpt['lstm_optim_state'])
+        optimizer_to_cuda(self.optimizer)
+        
+        return ckpt["epoch"]

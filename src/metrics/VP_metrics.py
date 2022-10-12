@@ -13,7 +13,7 @@ def VP_metrics(dict_list: List) -> Dict:
     mse, ssim, psnr, lpips = [], [], [], []
     for data_dict in dict_list:
         gt = data_dict["gt"]
-        pred = data_dict["pred"]
+        pred = data_dict[("pred", 0)]
         mse_, ssim_, psnr_, lpips_ = eval_seq(gt, pred)
         mse.append(mse_.cpu().numpy())
         ssim.append(ssim_.cpu().numpy())

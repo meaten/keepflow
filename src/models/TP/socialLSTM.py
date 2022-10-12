@@ -10,7 +10,7 @@ from utils import optimizer_to_cuda
 
 
 class socialLSTM(nn.Module):
-    def __init__(self, cfg: CfgNode, load=False) -> None:
+    def __init__(self, cfg: CfgNode) -> None:
         super(socialLSTM, self).__init__()
 
         self.output_path = Path(cfg.OUTPUT_DIR)
@@ -47,15 +47,15 @@ class socialLSTM(nn.Module):
         self.clipping_threshold_g = 1.5
         self.l2_loss_weight = 1.0
 
-        if load:
-            self.load()
-
-
     def forward(self, data_dict: Dict) -> Tuple[torch.Tensor, Dict]:
         return super().forward(data_dict)
 
     def predict(self, data_dict: Dict) -> Dict:
         data_dict = self.g.predict(data_dict)
+        return data_dict
+    
+    def predict_from_new_obs(self, data_dict: Dict, time_step: int) -> Dict:
+        # TODO: need to implement the density estimation & update
         return data_dict
 
     def update(self, data_dict: Dict) -> Dict:
@@ -66,7 +66,7 @@ class socialLSTM(nn.Module):
         
         if self.l2_loss_weight > 0:
             g_l2_loss_rel = self.l2_loss_weight * l2_loss(
-                data_dict["pred_rel"],
+                data_dict[("pred_rel", 0)],
                 data_dict["gt_rel"],
                 loss_mask,
                 mode='raw')
@@ -90,18 +90,25 @@ class socialLSTM(nn.Module):
 
         return {"g_loss": g_loss.item()}
 
-    def save(self, path: Path=None):
+    def save(self, epoch: int = 0, path: Path=None) -> None:
         if path is None:
             path = self.output_path / "ckpt.pt"
             
         ckpt = {
+            'epoch': epoch,
             'g_state': self.g.state_dict(),
             'g_optim_state': self.optimizer_g.state_dict(),
         }
 
         torch.save(ckpt, path)
+        
+    def check_saved_path(self, path: Path = None) -> bool:
+        if path is None:
+            path = self.output_path / "ckpt.pt"        
+        
+        return path.exists()
 
-    def load(self, path: Path=None):
+    def load(self, path: Path=None) -> int:
         if path is None:
             path = self.output_path / "ckpt.pt"
         
@@ -111,6 +118,8 @@ class socialLSTM(nn.Module):
         self.optimizer_g.load_state_dict(ckpt['g_optim_state'])
 
         optimizer_to_cuda(self.optimizer_g)
+        
+        return ckpt["epoch"]
         
         
 def l2_loss(pred_traj, pred_traj_gt, loss_mask, random=0, mode='average'):
@@ -769,8 +778,8 @@ class TrajectoryGenerator(nn.Module):
         pred_traj_fake_rel = self.forward(data_dict["obs"],
                                         data_dict["obs_rel"],
                                          data_dict['seq_start_end'])
-        data_dict["pred_rel"] = pred_traj_fake_rel
-        data_dict["pred"] = relative_to_abs(pred_traj_fake_rel, data_dict["obs"][-1])
+        data_dict[("pred_rel", 0)] = pred_traj_fake_rel
+        data_dict[("pred", 0)] = relative_to_abs(pred_traj_fake_rel, data_dict["obs"][-1])
         return data_dict
 
 def relative_to_abs(rel_traj, start_pos):

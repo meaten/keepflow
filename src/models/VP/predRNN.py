@@ -9,7 +9,7 @@ from utils import optimizer_to_cuda
 
 
 class ActionCondPredRNN_v2(nn.Module):
-    def __init__(self, cfg: CfgNode, load: bool=False) -> None:
+    def __init__(self, cfg: CfgNode) -> None:
         super(ActionCondPredRNN_v2, self).__init__()
         
         self.itr = 0
@@ -91,10 +91,6 @@ class ActionCondPredRNN_v2(nn.Module):
         
         self.optimizer = torch.optim.Adam(self.parameters(), lr=lr)
         self.optimizers = [self.optimizer]
-        
-        if load:
-            self.load()
-        
 
     def forward(self, frames, mask_true):
         input_frames = frames[:, :, :self.patch_ch, :, :]
@@ -175,7 +171,7 @@ class ActionCondPredRNN_v2(nn.Module):
         next_frames, _ = self.forward(frames, mask_true)
         if self.patch_size > 1:
             next_frames = reshape_patch_back(next_frames, self.patch_size)
-        data_dict["pred"] = next_frames[-self.pred_len:]
+        data_dict[("pred", 0)] = next_frames[-self.pred_len:]
         return data_dict
 
     def update(self, data_dict):
@@ -200,18 +196,25 @@ class ActionCondPredRNN_v2(nn.Module):
         
         return {"mse": mse_loss.item(), "decouple_loss": decouple_loss.item()}
 
-    def save(self, path: Path=None):
+    def save(self, epoch: int = 0, path: Path=None) -> None:
         if path is None:
             path = self.output_path / "ckpt.pt"
             
         ckpt = {
+            'epoch': epoch,
             'model_state': self.state_dict(),
             'model_optim_state': self.optimizer.state_dict(),
         }
 
         torch.save(ckpt, path)
+        
+    def check_saved_path(self, path: Path = None) -> bool:
+        if path is None:
+            path = self.output_path / "ckpt.pt"        
+        
+        return path.exists()
 
-    def load(self, path: Path=None):
+    def load(self, path: Path=None) -> int:
         if path is None:
             path = self.output_path / "ckpt.pt"
         
@@ -225,6 +228,8 @@ class ActionCondPredRNN_v2(nn.Module):
             optimizer_to_cuda(self.optimizer)
         except KeyError:
             pass
+        
+        return ckpt['epoch']
         
     def reserve_schedule_sampling_exp(self, itr, batch_size):
         if itr < self.r_sampling_step_1:

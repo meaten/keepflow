@@ -9,18 +9,18 @@ from models.VP.VP_models import Build_VP_model
 from models.MP.MP_models import Build_MP_model
 
 
-def Build_Model(cfg: CfgNode, load: bool=False) -> nn.Module:
+def Build_Model(cfg: CfgNode) -> nn.Module:
     if cfg.MODEL.TYPE == "GT":
         return GT(cfg)
     elif cfg.MODEL.TYPE == "COPY_LAST":
         return COPY_LAST(cfg)
 
     if cfg.DATA.TASK == "TP":
-        return Build_TP_model(cfg, load=load)
+        return Build_TP_model(cfg)
     elif cfg.DATA.TASK == "VP":
-        return Build_VP_model(cfg, load=load)
+        return Build_VP_model(cfg)
     elif cfg.DATA.TASK == "MP":
-        return Build_MP_model(cfg, load=load)
+        return Build_MP_model(cfg)
     else:
         raise(ValueError)
 
@@ -32,17 +32,10 @@ class ModelTemplate(nn.Module):
     def __init__(self) -> None:
         super(ModelTemplate, self).__init__()
 
-    def forward(self, data_dict):
-        data_dict = self.predict(data_dict)
-        loss = self.loss_fn(data_dict)
-        return loss, data_dict
+    def predict(self, data_dict):
+        pass
 
     def update(self, data_dict):
-        loss, _ = self.forward(data_dict)
-        loss.update()
-        return loss
-
-    def eval(self):
         pass
 
 class GT(ModelTemplate):

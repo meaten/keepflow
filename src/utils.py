@@ -14,9 +14,8 @@ def load_config(args: argparse.Namespace) -> CfgNode:
         print(f"Configuration file loaded from {conf}.")
         cfg_.merge_from_file(conf)
         cfg_.OUTPUT_DIR = os.path.join(cfg_.OUTPUT_DIR, 
-                                       cfg_.DATA.TASK, 
-                                       cfg_.DATA.DATASET_NAME,
-                                       cfg_.MODEL.TYPE)
+                                       os.path.splitext(conf)[0])
+                                       
     else:
         print("Use default configuration.")
         cfg_.OUTPUT_DIR = os.path.join(cfg_.OUTPUT_DIR, "default")
