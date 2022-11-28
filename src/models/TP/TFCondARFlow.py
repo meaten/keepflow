@@ -259,14 +259,14 @@ class FlowSequential(nn.Sequential):
         for module in self:
             x, log_abs_det_jacobian = module(x, y)
             sum_log_abs_det_jacobians += log_abs_det_jacobian
-        return x, sum_log_abs_det_jacobians
+        return x, torch.sum(sum_log_abs_det_jacobians, dim=-1)
 
     def inverse(self, u, y):
         sum_log_abs_det_jacobians = 0
         for module in reversed(self):
             u, log_abs_det_jacobian = module.inverse(u, y)
             sum_log_abs_det_jacobians += log_abs_det_jacobian
-        return u, sum_log_abs_det_jacobians
+        return u, torch.sum(sum_log_abs_det_jacobians, dim=-1)
 
 
 class BatchNorm(nn.Module):
@@ -540,7 +540,7 @@ class Flow(nn.Module):
 
     def log_prob(self, x, cond):
         u, sum_log_abs_det_jacobians = self.forward(x, cond)
-        return torch.sum(self.base_dist.log_prob(u) + sum_log_abs_det_jacobians, dim=-1)
+        return torch.sum(self.base_dist.log_prob(u), dim=-1) + sum_log_abs_det_jacobians
 
     def sample(self, sample_shape=torch.Size(), cond=None):
         if cond is not None:
@@ -560,7 +560,7 @@ class Flow(nn.Module):
 
         u = self.base_dist.sample(shape)
         sample, sum_log_abs_det_jacobians = self.inverse(u, cond)
-        return sample, torch.sum(self.base_dist.log_prob(u) + sum_log_abs_det_jacobians, dim=-1)
+        return sample, torch.sum(self.base_dist.log_prob(u), dim=-1) + sum_log_abs_det_jacobians
 
 
 class RealNVP(Flow):

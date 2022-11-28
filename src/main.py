@@ -107,7 +107,8 @@ def evaluate_model(cfg: CfgNode, model: torch.nn.Module, data_loader: torch.util
             torch.cuda.synchronize()
             for _ in range(cfg.TEST.N_TRIAL):
                 starter.record()
-                result_dict = model.predict(deepcopy(data_dict))
+                result_dict = model.predict(deepcopy(data_dict), return_prob=visualize)
+                #result_dict = model.predict(deepcopy(data_dict))
                 ender.record()
                 torch.cuda.synchronize()
                 curr_run_time = starter.elapsed_time(ender)

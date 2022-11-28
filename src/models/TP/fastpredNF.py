@@ -194,6 +194,8 @@ class fastpredNF_TP(nn.Module):
     
     def predict_from_new_obs(self, data_dict: Dict, time_step: int) -> Dict:
         assert 0 < time_step and time_step < len(data_dict["obs"])
+        if not ("prob", 0) in data_dict.keys():
+            return data_dict
         self.norm_input(data_dict)
         data_dict[("prob", time_step)] = data_dict[("prob", 0)][time_step:].clone()
         
@@ -277,6 +279,7 @@ class fastpredNF_TP(nn.Module):
         
         return ckpt["epoch"]
 
+
 class fastpredNF(nn.Module):
     def __init__(self,
                  input_size: int,
@@ -311,7 +314,6 @@ class fastpredNF(nn.Module):
         seq_log_det_jacobians_cumsum = 0
         for step in range(seq.shape[0]-1, -1, -1):
             x, log_det_jacobian = self.net(x, cond[step:])
-            log_det_jacobian = torch.sum(log_det_jacobian, dim=-1)
             seq_log_det_jacobians_cumsum += log_det_jacobian
             if not step == 0:
                 x = torch.cat([seq[step-1][None], x], dim=0)
@@ -325,7 +327,7 @@ class fastpredNF(nn.Module):
         seq_log_det_jacobians = 0
         seq_u, log_det_jacobian = self.net(seq, cond)
         seq_log_det_jacobians += log_det_jacobian
-        return seq_u, torch.sum(seq_log_det_jacobians, dim=-1)
+        return seq_u, seq_log_det_jacobians
 
     def inverse(self, u, cond):
         seq = []
@@ -336,7 +338,6 @@ class fastpredNF(nn.Module):
             seq_log_det_jacobians.append(log_det_jacobian)
         seq = torch.stack(seq)
         seq_log_det_jacobians = torch.stack(seq_log_det_jacobians)
-        seq_log_det_jacobians = torch.sum(seq_log_det_jacobians, dim=-1)
         seq_log_det_jacobians_cumsum = torch.cumsum(
             seq_log_det_jacobians, dim=0)
         seq_log_det_jacobians_cumsum /= torch.cumsum(torch.ones_like(seq_log_det_jacobians), dim=0)
@@ -401,7 +402,6 @@ class fastpredNF_separate(fastpredNF):
         seq_log_det_jacobians_cumsum = 0
         for step in range(seq.shape[0]-1, -1, -1):
             x, log_det_jacobian = self.net[step](x, cond[step:])
-            log_det_jacobian = torch.sum(log_det_jacobian, dim=-1)
             seq_log_det_jacobians_cumsum += log_det_jacobian
             if not step == 0:
                 x = torch.cat([seq[step-1][None], x], dim=0)
@@ -416,7 +416,6 @@ class fastpredNF_separate(fastpredNF):
         seq_log_det_jacobians = []
         for step in range(seq.shape[0]):
             u, log_det_jacobian = self.net[step](seq[step], cond[step])
-            log_det_jacobian = torch.sum(log_det_jacobian, dim=-1)
             seq_u.append(u)
             seq_log_det_jacobians.append(log_det_jacobian)
         seq_u = torch.stack(seq_u)
@@ -428,7 +427,6 @@ class fastpredNF_separate(fastpredNF):
         seq_log_det_jacobians = []
         for step in range(cond.shape[0]):
             u, log_det_jacobian = self.net[step].inverse(u, cond[step])
-            log_det_jacobian = torch.sum(log_det_jacobian, dim=-1)
             seq.append(u)
             seq_log_det_jacobians.append(log_det_jacobian)
         seq = torch.stack(seq)
@@ -472,7 +470,6 @@ class fastpredNF_separate_cond(fastpredNF):
                                   seq_cond[..., :step * self.input_size].expand(pred_len - step, -1, -1)],
                                  dim=-1)
             x, log_det_jacobian = self.net[step](x, cond_cat)
-            log_det_jacobian = torch.sum(log_det_jacobian, dim=-1)
             seq_log_det_jacobians_cumsum += log_det_jacobian
             if not step == 0:
                 x = torch.cat([seq[step-1][None], x], dim=0)
@@ -490,7 +487,6 @@ class fastpredNF_separate_cond(fastpredNF):
         for step in range(seq.shape[0]):
             cond_cat = torch.cat([cond[step], seq_cond[..., :step * self.input_size]], dim=-1)
             u, log_det_jacobian = self.net[step](seq[step], cond_cat)
-            log_det_jacobian = torch.sum(log_det_jacobian, dim=-1)
             seq_u.append(u)
             seq_log_det_jacobians.append(log_det_jacobian)
         seq_u = torch.stack(seq_u)
@@ -509,7 +505,6 @@ class fastpredNF_separate_cond(fastpredNF):
                 u, log_det_jacobian = self.net[step].inverse(u, cond_cat)
             else:
                 u, log_det_jacobian = self.net[step].inverse(u, cond[step])
-            log_det_jacobian = torch.sum(log_det_jacobian, dim=-1)
             seq.append(u)
             seq_log_det_jacobians.append(log_det_jacobian)
         seq = torch.stack(seq)
@@ -631,52 +626,27 @@ class fastpredNF_VFlow(fastpredNF):
         #                                hidden_size=hidden_size,
         #                                n_hidden=n_hidden,
         #                                cond_label_size=cond_label_size)
-        self.register_buffer("sample_var", torch.ones(self.input_size) * 0.1)
-        
-    def sample_dist(self, pos):
-        return Normal(pos, self.sample_var)
         
     def forward_sequential(self, seq, cond):
-        x = seq[-1:].detach().clone()
-        x, log_det_jacobian_aug = self.augment(x)
-        seq_log_det_jacobians_cumsum = 0
-        for step in range(seq.shape[0]-1, -1, -1):
-            x, log_det_jacobian = self.net(x, cond[step:])
-            seq_log_det_jacobians_cumsum += torch.sum(log_det_jacobian, dim=-1)
-            if not step == 0:
-                x_, log_det_jacobian = self.augment(seq[step-1][None])
-                x = torch.cat([x_, x], dim=0)
-                seq_log_det_jacobians_cumsum = torch.cat([log_det_jacobian,
-                                                   seq_log_det_jacobians_cumsum], dim=0)
-        seq_log_det_jacobians_cumsum /= torch.cumsum(torch.ones_like(seq_log_det_jacobians_cumsum), dim=0)
+        seq, log_det_jacobian_aug = self.augment(seq)
+        log_det_jacobian_aug = log_det_jacobian_aug[-1:]
+        seq_u, seq_log_det_jacobians_cumsum = super().forward_sequential(seq, cond)
         seq_log_det_jacobians_cumsum += log_det_jacobian_aug
-        seq_u, log_det_jacobian = self.augment.split(x)
+        seq_u, log_det_jacobian = self.augment.split(seq_u)
         seq_log_det_jacobians_cumsum += log_det_jacobian
         return seq_u, seq_log_det_jacobians_cumsum
-    
+        
     def forward_separate(self, seq, cond):
-        seq, seq_log_det_jacobians = self.augment(seq)
-        seq_u, log_det_jacobian = self.net(seq, cond)
-        seq_log_det_jacobians += torch.sum(log_det_jacobian, dim=-1)
+        seq, seq_log_det_jacobians_aug = self.augment(seq)
+        seq_u, seq_log_det_jacobians = super().forward_separate(seq, cond)
+        seq_log_det_jacobians += seq_log_det_jacobians_aug
         seq_u, log_det_jacobian = self.augment.split(seq_u)
         seq_log_det_jacobians += log_det_jacobian
         return seq_u, seq_log_det_jacobians
 
     def inverse(self, u, cond):
-        seq = []
-        seq_log_det_jacobians = []
         u, log_det_jacobian_aug = self.augment(u)
-        for step in range(cond.shape[0]):
-            u, log_det_jacobian = self.net.inverse(u, cond[step])
-            log_det_jacobian = torch.sum(log_det_jacobian, dim=-1)
-            seq.append(u)
-            seq_log_det_jacobians.append(log_det_jacobian)
-                
-        seq = torch.stack(seq)
-        seq_log_det_jacobians = torch.stack(seq_log_det_jacobians)
-        seq_log_det_jacobians_cumsum = torch.cumsum(
-            seq_log_det_jacobians, dim=0)
-        seq_log_det_jacobians_cumsum /= torch.cumsum(torch.ones_like(seq_log_det_jacobians_cumsum), dim=0)
+        seq, seq_log_det_jacobians_cumsum, seq_log_det_jacobians = super().inverse(u, cond)
         seq_log_det_jacobians_cumsum += log_det_jacobian_aug
         seq, log_det_jacobian = self.augment.split(seq)
         seq_log_det_jacobians_cumsum += log_det_jacobian
@@ -684,7 +654,7 @@ class fastpredNF_VFlow(fastpredNF):
         return seq, seq_log_det_jacobians_cumsum, seq_log_det_jacobians
     
     
-class fastpredNF_VFlow_separate(fastpredNF_VFlow):
+class fastpredNF_VFlow_separate(fastpredNF_separate):
     def __init__(self,
                  input_size: int,
                  n_blocks: int,
@@ -697,8 +667,14 @@ class fastpredNF_VFlow_separate(fastpredNF_VFlow):
                          n_blocks,
                          hidden_size,
                          n_hidden,
-                         cond_label_size,
-                         aug_size)
+                         cond_label_size)
+        
+        self.input_size = input_size
+        self.aug_size = aug_size
+        self.flow_dim = input_size + aug_size
+        
+        self.augment = Augment_VFlow(input_size=self.input_size,
+                                     aug_size=self.aug_size)
         
         self.net = nn.ModuleList([create_RealNVP_step(n_blocks=n_blocks,
                                                       input_size=self.flow_dim,
@@ -715,55 +691,25 @@ class fastpredNF_VFlow_separate(fastpredNF_VFlow):
         
         
     def forward_sequential(self, seq, cond):
-        x = seq[-1:].detach().clone()
-        x, log_det_jacobian_aug = self.augment(x)
-        seq_log_det_jacobians_cumsum = 0
-        for step in range(seq.shape[0]-1, -1, -1):
-            x, log_det_jacobian = self.net[step](x, cond[step:])
-            seq_log_det_jacobians_cumsum += torch.sum(log_det_jacobian, dim=-1)
-            if not step == 0:
-                x_, log_det_jacobian = self.augment(seq[step-1][None])
-                x = torch.cat([x_, x], dim=0)
-                seq_log_det_jacobians_cumsum = torch.cat([log_det_jacobian,
-                                                   seq_log_det_jacobians_cumsum], dim=0)
-        seq_log_det_jacobians_cumsum /= torch.cumsum(torch.ones_like(seq_log_det_jacobians_cumsum), dim=0)
+        seq, log_det_jacobian_aug = self.augment(seq)
+        log_det_jacobian_aug = log_det_jacobian_aug[-1:]
+        seq_u, seq_log_det_jacobians_cumsum = super().forward_sequential(seq, cond)
         seq_log_det_jacobians_cumsum += log_det_jacobian_aug
-        seq_u, log_det_jacobian = self.augment.split(x)
+        seq_u, log_det_jacobian = self.augment.split(seq_u)
         seq_log_det_jacobians_cumsum += log_det_jacobian
         return seq_u, seq_log_det_jacobians_cumsum
-    
+        
     def forward_separate(self, seq, cond):
-        seq, seq_log_det_jacobians = self.augment(seq)
-        
-        seq_u = []
-        seq_log_det_jacobians = []
-        for step in range(seq.shape[0]):
-            u, log_det_jacobian = self.net[step](seq[step], cond[step])
-            log_det_jacobian = torch.sum(log_det_jacobian, dim=-1)
-            seq_u.append(u)
-            seq_log_det_jacobians.append(log_det_jacobian)
-        seq_u = torch.stack(seq_u)
-        seq_log_det_jacobians = torch.stack(seq_log_det_jacobians)
-        
+        seq, seq_log_det_jacobians_aug = self.augment(seq)
+        seq_u, seq_log_det_jacobians = super().forward_separate(seq, cond)
+        seq_log_det_jacobians += seq_log_det_jacobians_aug
         seq_u, log_det_jacobian = self.augment.split(seq_u)
         seq_log_det_jacobians += log_det_jacobian
         return seq_u, seq_log_det_jacobians
 
     def inverse(self, u, cond):
-        seq = []
-        seq_log_det_jacobians = []
         u, log_det_jacobian_aug = self.augment(u)
-        for step in range(cond.shape[0]):
-            u, log_det_jacobian = self.net[step].inverse(u, cond[step])
-            log_det_jacobian = torch.sum(log_det_jacobian, dim=-1)
-            seq.append(u)
-            seq_log_det_jacobians.append(log_det_jacobian)
-                
-        seq = torch.stack(seq)
-        seq_log_det_jacobians = torch.stack(seq_log_det_jacobians)
-        seq_log_det_jacobians_cumsum = torch.cumsum(
-            seq_log_det_jacobians, dim=0)
-        seq_log_det_jacobians_cumsum /= torch.cumsum(torch.ones_like(seq_log_det_jacobians_cumsum), dim=0)
+        seq, seq_log_det_jacobians_cumsum, seq_log_det_jacobians = super().inverse(u, cond)
         seq_log_det_jacobians_cumsum += log_det_jacobian_aug
         seq, log_det_jacobian = self.augment.split(seq)
         seq_log_det_jacobians_cumsum += log_det_jacobian
@@ -771,7 +717,7 @@ class fastpredNF_VFlow_separate(fastpredNF_VFlow):
         return seq, seq_log_det_jacobians_cumsum, seq_log_det_jacobians
     
     
-class fastpredNF_VFlow_separate_cond(fastpredNF_VFlow):
+class fastpredNF_VFlow_separate_cond(fastpredNF_separate_cond):
     def __init__(self,
                  input_size: int,
                  n_blocks: int,
@@ -784,8 +730,14 @@ class fastpredNF_VFlow_separate_cond(fastpredNF_VFlow):
                          n_blocks,
                          hidden_size,
                          n_hidden,
-                         cond_label_size,
-                         aug_size)
+                         cond_label_size)
+        
+        self.input_size = input_size
+        self.aug_size = aug_size
+        self.flow_dim = input_size + aug_size
+        
+        self.augment = Augment_VFlow(input_size=self.input_size,
+                                     aug_size=self.aug_size)
         
         # increase cond_label_size for conditioning trajectory
         self.net = nn.ModuleList([create_RealNVP_step(n_blocks=n_blocks,
@@ -807,7 +759,7 @@ class fastpredNF_VFlow_separate_cond(fastpredNF_VFlow):
                                   seq_cond[..., :step * self.input_size].expand(pred_len - step, -1, -1)],
                                  dim=-1)
             x, log_det_jacobian = self.net[step](x, cond_cat)
-            seq_log_det_jacobians_cumsum += torch.sum(log_det_jacobian, dim=-1)
+            seq_log_det_jacobians_cumsum += log_det_jacobian
             if not step == 0:
                 x_, log_det_jacobian = self.augment(seq[step-1][None])
                 x = torch.cat([x_, x], dim=0)
@@ -829,7 +781,6 @@ class fastpredNF_VFlow_separate_cond(fastpredNF_VFlow):
         for step in range(seq.shape[0]):
             cond_cat = torch.cat([cond[step], seq_cond[..., :step * self.input_size]], dim=-1)
             u, log_det_jacobian = self.net[step](seq[step], cond_cat)
-            log_det_jacobian = torch.sum(log_det_jacobian, dim=-1)
             seq_u.append(u)
             seq_log_det_jacobians.append(log_det_jacobian)
         seq_u = torch.stack(seq_u)
@@ -853,7 +804,6 @@ class fastpredNF_VFlow_separate_cond(fastpredNF_VFlow):
                 u, log_det_jacobian = self.net[step].inverse(u, cond_cat)
             else:
                 u, log_det_jacobian = self.net[step].inverse(u, cond[step])
-            log_det_jacobian = torch.sum(log_det_jacobian, dim=-1)
             seq.append(u)
             seq_c.append(u[..., :self.input_size])
             seq_log_det_jacobians.append(log_det_jacobian)
@@ -868,7 +818,6 @@ class fastpredNF_VFlow_separate_cond(fastpredNF_VFlow):
         # TODO: need to consider augmentation gap in 'seq_log_det_jacobians'
         return seq, seq_log_det_jacobians_cumsum, seq_log_det_jacobians
     
-
 
 class DiagonalGaussianConditionalDensity(nn.Module):
     def __init__(self,
@@ -954,14 +903,14 @@ class CIF_step(nn.Module):
         w, log_det_jac = self.bijection.forward(z, u)
         log_q_u = self.q_u_given_w.log_prob(u, torch.cat([w, y], dim=-1))
         
-        return w, torch.sum(log_det_jac, dim=-1) + log_q_u - log_r_u
+        return w, log_det_jac + log_q_u - log_r_u
     
     def inverse(self, w, y):
         u, log_q_u = self.q_u_given_w.sample(torch.cat([w, y], dim=-1))
         z, log_det_jac = self.bijection.inverse(w, u)
         log_r_u = self.r_u_given_z.log_prob(u, torch.cat([z, y], dim=-1))
 
-        return z, torch.sum(log_det_jac, dim=-1) + log_q_u - log_r_u
+        return z, log_det_jac + log_q_u - log_r_u
     
     
 class BatchNorm_reduce(BatchNorm):
@@ -972,26 +921,6 @@ class BatchNorm_reduce(BatchNorm):
     def inverse(self, y, cond_y=None):
         x, log_abs_det_jacobian = super().inverse(y, cond_y)
         return x, torch.sum(log_abs_det_jacobian, dim=-1)
-    
-def create_RealNVP_CIF_step(n_blocks,
-                        input_size,
-                        hidden_size,
-                        n_hidden,
-                        cond_label_size=None,
-                        batch_norm=True):
-
-    modules = []
-    mask = torch.arange(input_size).float() % 2
-    for i in range(n_blocks):
-        modules += [
-            CIF_step(LinearMaskedCoupling(input_size, hidden_size, n_hidden, mask, cond_label_size),
-                     input_size,
-                     cond_label_size)
-        ]
-        mask = 1 - mask
-        modules += batch_norm * [BatchNorm_reduce(input_size)]
-
-    return FlowSequential(*modules)
 
 
 class fastpredNF_CIF(fastpredNF):
@@ -1008,7 +937,7 @@ class fastpredNF_CIF(fastpredNF):
             n_hidden,
             cond_label_size
         )
-        """
+        
         bijection = create_RealNVP_step(n_blocks=n_blocks,
                                        input_size=self.input_size,
                                        hidden_size=hidden_size,
@@ -1018,48 +947,7 @@ class fastpredNF_CIF(fastpredNF):
         self.net = CIF_step(bijection,
                             input_size=self.input_size,
                             cond_label_size=cond_label_size)
-        """
-        
-        self.net = create_RealNVP_CIF_step(n_blocks=n_blocks,
-                                       input_size=self.input_size,
-                                       hidden_size=hidden_size,
-                                       n_hidden=n_hidden,
-                                       cond_label_size=cond_label_size)
-        
-    def forward_sequential(self, seq, cond):
-        x = seq[-1:].detach().clone()
-        seq_log_det_jacobians_cumsum = 0
-        for step in range(seq.shape[0]-1, -1, -1):
-            x, log_det_jacobian = self.net(x, cond[step:])
-            seq_log_det_jacobians_cumsum += log_det_jacobian
-            if not step == 0:
-                x = torch.cat([seq[step-1][None], x], dim=0)
-                seq_log_det_jacobians_cumsum = torch.cat([torch.zeros(seq_log_det_jacobians_cumsum.shape[1:])[None],
-                                                   seq_log_det_jacobians_cumsum], dim=0)
-        seq_u = x
-        seq_log_det_jacobians_cumsum /= torch.cumsum(torch.ones_like(seq_log_det_jacobians_cumsum), dim=0)
-        return seq_u, seq_log_det_jacobians_cumsum
-    
-    def forward_separate(self, seq, cond):
-        seq_log_det_jacobians = 0
-        seq_u, log_det_jacobian = self.net(seq, cond)
-        seq_log_det_jacobians += log_det_jacobian
-        return seq_u, seq_log_det_jacobians
-        
-    def inverse(self, u, cond):
-        seq = []
-        seq_log_det_jacobians = []
-        for step in range(cond.shape[0]):
-            u, log_det_jacobian = self.net.inverse(u, cond[step])
-            seq.append(u)
-            seq_log_det_jacobians.append(log_det_jacobian)
-        seq = torch.stack(seq)
-        seq_log_det_jacobians = torch.stack(seq_log_det_jacobians)
-        seq_log_det_jacobians_cumsum = torch.cumsum(
-            seq_log_det_jacobians, dim=0)
-        seq_log_det_jacobians_cumsum /= torch.cumsum(torch.ones_like(seq_log_det_jacobians_cumsum), dim=0)
-        return seq, seq_log_det_jacobians_cumsum, seq_log_det_jacobians
-    
+
     
 class fastpredNF_CIF_separate(fastpredNF_separate):
     def __init__(self,
@@ -1086,48 +974,9 @@ class fastpredNF_CIF_separate(fastpredNF_separate):
                                            input_size,
                                            cond_label_size)
                                   for _ in range(pred_len)])
-    
-    def forward_sequential(self, seq, cond):
-        x = seq[-1:].detach().clone()
-        seq_log_det_jacobians_cumsum = 0
-        for step in range(seq.shape[0]-1, -1, -1):
-            x, log_det_jacobian = self.net[step](x, cond[step:])
-            seq_log_det_jacobians_cumsum += log_det_jacobian
-            if not step == 0:
-                x = torch.cat([seq[step-1][None], x], dim=0)
-                seq_log_det_jacobians_cumsum = torch.cat([torch.zeros(seq_log_det_jacobians_cumsum.shape[1:])[None],
-                                                   seq_log_det_jacobians_cumsum], dim=0)
-        seq_u = x
-        seq_log_det_jacobians_cumsum /= torch.cumsum(torch.ones_like(seq_log_det_jacobians_cumsum), dim=0)
-        return seq_u, seq_log_det_jacobians_cumsum
-    
-    def forward_separate(self, seq, cond):
-        seq_u = []
-        seq_log_det_jacobians = []
-        for step in range(seq.shape[0]):
-            u, log_det_jacobian = self.net[step](seq[step], cond[step])
-            seq_u.append(u)
-            seq_log_det_jacobians.append(log_det_jacobian)
-        seq_u = torch.stack(seq_u)
-        seq_log_det_jacobians = torch.stack(seq_log_det_jacobians)
-        return seq_u, seq_log_det_jacobians
 
-    def inverse(self, u, cond):
-        seq = []
-        seq_log_det_jacobians = []
-        for step in range(cond.shape[0]):
-            u, log_det_jacobian = self.net[step].inverse(u, cond[step])
-            seq.append(u)
-            seq_log_det_jacobians.append(log_det_jacobian)
-        seq = torch.stack(seq)
-        seq_log_det_jacobians = torch.stack(seq_log_det_jacobians)
-        seq_log_det_jacobians_cumsum = torch.cumsum(
-            seq_log_det_jacobians, dim=0)
-        seq_log_det_jacobians_cumsum /= torch.cumsum(torch.ones_like(seq_log_det_jacobians_cumsum), dim=0)
-        return seq, seq_log_det_jacobians_cumsum, seq_log_det_jacobians
     
-    
-class fastpredNF_CIF_separate_cond(fastpredNF):
+class fastpredNF_CIF_separate_cond(fastpredNF_separate_cond):
     def __init__(self,
                  input_size: int,
                  n_blocks: int,
@@ -1151,57 +1000,3 @@ class fastpredNF_CIF_separate_cond(fastpredNF):
                                            input_size,
                                            cond_label_size + i * self.input_size)
                                   for i in range(pred_len)])
-        
-    def forward_sequential(self, seq, cond):
-        x = seq[-1:].detach().clone()
-        pred_len, batch_size, *_ = seq.shape
-        seq_cond = seq.transpose(0, 1).reshape(batch_size, pred_len * self.input_size)[None]
-        seq_log_det_jacobians_cumsum = 0
-        for step in range(seq.shape[0]-1, -1, -1):
-            cond_cat = torch.cat([cond[step:], 
-                                  seq_cond[..., :step * self.input_size].expand(pred_len - step, -1, -1)],
-                                 dim=-1)
-            x, log_det_jacobian = self.net[step](x, cond_cat)
-            seq_log_det_jacobians_cumsum += log_det_jacobian
-            if not step == 0:
-                x = torch.cat([seq[step-1][None], x], dim=0)
-                seq_log_det_jacobians_cumsum = torch.cat([torch.zeros(seq_log_det_jacobians_cumsum.shape[1:])[None],
-                                                   seq_log_det_jacobians_cumsum], dim=0)
-        seq_u = x
-        seq_log_det_jacobians_cumsum /= torch.cumsum(torch.ones_like(seq_log_det_jacobians_cumsum), dim=0)
-        return seq_u, seq_log_det_jacobians_cumsum
-    
-    def forward_separate(self, seq, cond):
-        pred_len, batch_size, *_ = seq.shape
-        seq_cond = seq.transpose(0, 1).reshape(batch_size, pred_len * self.input_size)
-        seq_u = []
-        seq_log_det_jacobians = []
-        for step in range(seq.shape[0]):
-            cond_cat = torch.cat([cond[step], seq_cond[..., :step * self.input_size]], dim=-1)
-            u, log_det_jacobian = self.net[step](seq[step], cond_cat)
-            seq_u.append(u)
-            seq_log_det_jacobians.append(log_det_jacobian)
-        seq_u = torch.stack(seq_u)
-        seq_log_det_jacobians = torch.stack(seq_log_det_jacobians)
-        return seq_u, seq_log_det_jacobians
-
-    def inverse(self, u, cond):
-        seq = []
-        seq_log_det_jacobians = []
-        n_sample, batch_size, _ = u.shape
-        for step in range(cond.shape[0]):
-            if not step == 0:
-                seq_cond = torch.stack(seq).transpose(0,1).transpose(1,2)
-                seq_cond = seq_cond.reshape(n_sample, batch_size, -1)
-                cond_cat = torch.cat([cond[step], seq_cond], dim=-1)
-                u, log_det_jacobian = self.net[step].inverse(u, cond_cat)
-            else:
-                u, log_det_jacobian = self.net[step].inverse(u, cond[step])
-            seq.append(u)
-            seq_log_det_jacobians.append(log_det_jacobian)
-        seq = torch.stack(seq)
-        seq_log_det_jacobians = torch.stack(seq_log_det_jacobians)
-        seq_log_det_jacobians_cumsum = torch.cumsum(
-            seq_log_det_jacobians, dim=0)
-        seq_log_det_jacobians_cumsum /= torch.cumsum(torch.ones_like(seq_log_det_jacobians_cumsum), dim=0)
-        return seq, seq_log_det_jacobians_cumsum, seq_log_det_jacobians
