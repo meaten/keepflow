@@ -1,0 +1,12 @@
+MODEL:
+  TYPE: Trajectron
+
+DATA:
+  DATASET_NAME: "simfork"
+  TP:
+    STATE: state_pva
+    PRED_STATE: state_v
+SOLVER:
+  USE_SCHEDULER: True
+  ITER: 500
+  SAVE_EVERY: 10

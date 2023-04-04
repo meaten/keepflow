@@ -1,14 +1,24 @@
 from pathlib import Path
+import numpy as np
 import matplotlib
 import matplotlib.pyplot as plt
-import numpy as np
+import seaborn as sns
+
  
-def plot_density(x: np.array, y: np.array, p: np.array, path: Path) -> None:
+def plot_density(x: np.array, y: np.array, p: np.array, path: Path, traj = None) -> None:
     plt.pcolormesh(x, y, p.reshape(x.shape),
                    shading='auto',
-                   cmap=plt.cm.get_cmap("jet"),
+                   cmap=plt.cm.get_cmap("Greens"),
                    norm=matplotlib.colors.Normalize())
+    if traj is not None:
+        obs, gt = traj
+        sns.lineplot(x=gt[:, 0], y=gt[:, 1],
+                     color='black', marker='o')
+        sns.lineplot(x=obs[:, 0], y=obs[:, 1],
+                     color='green', marker='o')
+        
     plt.axis('off')
+    plt.gca().set_aspect('equal', adjustable='box')
     plt.savefig(path, bbox_inches='tight')
     plt.close()
 

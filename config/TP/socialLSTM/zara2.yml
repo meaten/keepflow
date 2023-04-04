@@ -3,3 +3,10 @@ MODEL:
 
 DATA:
   DATASET_NAME: "zara2"
+  BATCH_SIZE: 64
+  TP:
+    STATE: state_p
+    PRED_STATE: state_p
+    
+SOLVER:
+  USE_SCHEDULER: True

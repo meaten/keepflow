@@ -5,7 +5,7 @@ from typing import Callable
 def Build_Metrics(cfg: CfgNode) -> Callable:
     if cfg.DATA.TASK == "TP":
         from metrics.TP_metrics import TP_metrics
-        return TP_metrics
+        return TP_metrics(cfg)
 
     if cfg.DATA.TASK == "VP":
         from metrics.VP_metrics import VP_metrics

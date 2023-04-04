@@ -5,7 +5,7 @@ import torch
 import torch.nn as nn
 import torch.optim as optim
 
-from utils import optimizer_to_cuda
+from utils import optimizer_to_device
 
 
 from models.TP.socialLSTM import (
@@ -21,6 +21,7 @@ from models.TP.socialLSTM import (
 class socialGAN(nn.Module):
     def __init__(self, cfg: CfgNode) -> None:
         super(socialGAN, self).__init__()
+        self.device = cfg.DEVICE
 
         self.output_path = Path(cfg.OUTPUT_DIR)
 
@@ -40,10 +41,12 @@ class socialGAN(nn.Module):
             noise_dim=(8,),
             noise_type='gaussian',
             noise_mix_type='global',
-            pooling_type='pool_net',
+            pooling_type='none',
+            #pooling_type='pool_net',
             pool_every_timestep=False,
             dropout=0,
-            bottleneck_dim=8,
+            bottleneck_dim=0,
+            #bottleneck_dim=8,
             neighborhood_size=2.0,
             grid_size=8,
             batch_norm=False
@@ -53,6 +56,7 @@ class socialGAN(nn.Module):
             obs_len=cfg.DATA.OBSERVE_LENGTH,
             pred_len=cfg.DATA.PREDICT_LENGTH,
             embedding_dim=16,
+            #h_dim=48,
             h_dim=64,
             mlp_dim=64,
             num_layers=1,
@@ -78,8 +82,11 @@ class socialGAN(nn.Module):
     def forward(self, data_dict: Dict) -> Tuple[torch.Tensor, Dict]:
         return super().forward(data_dict)
 
-    def predict(self, data_dict: Dict) -> Dict:
-        data_dict = self.g.predict(data_dict)
+    def predict(self, data_dict: Dict, return_prob=False) -> Dict:
+        if return_prob:
+            data_dict = self.g.sample(data_dict)
+        else:
+            data_dict = self.g.predict(data_dict)
         return data_dict
 
     def predict_from_new_obs(self, data_dict: Dict, time_step: int) -> Dict:
@@ -89,13 +96,13 @@ class socialGAN(nn.Module):
     def update(self, data_dict: Dict) -> Dict:
         for _ in range(self.d_step):
             data_dict = self.predict(data_dict)
-            traj_real = torch.cat([data_dict["obs"], data_dict["gt"]], dim=0)
-            traj_real_rel = torch.cat([data_dict["obs_rel"], data_dict["gt_rel"]], dim=0)
-            traj_fake = torch.cat([data_dict["obs"], data_dict[("pred", 0)]], dim=0)
-            traj_fake_rel = torch.cat([data_dict["obs_rel"], data_dict[("pred_rel", 0)]], dim=0)
+            traj_real = torch.cat([data_dict["obs_st_slstm"].permute(1, 0, 2), data_dict["gt_st_slstm"].permute(1, 0, 2)], dim=0)
+            traj_real_rel = torch.cat([data_dict["obs_st_slstm_rel"].permute(1, 0, 2), data_dict["gt_st_slstm_rel"].permute(1, 0, 2)], dim=0)
+            traj_fake = torch.cat([data_dict["obs_st_slstm"].permute(1, 0, 2), data_dict[("pred_st_slstm", 0)].permute(1, 0, 2)], dim=0)
+            traj_fake_rel = torch.cat([data_dict["obs_st_slstm_rel"].permute(1, 0, 2), data_dict[("pred_st_slstm_rel", 0)].permute(1, 0, 2)], dim=0)
 
-            scores_fake = self.d(traj_fake, traj_fake_rel, data_dict["seq_start_end"])
-            scores_real = self.d(traj_real, traj_real_rel, data_dict["seq_start_end"])
+            scores_fake = self.d(traj_fake, traj_fake_rel, data_dict["seq_start_end_slstm"])
+            scores_real = self.d(traj_real, traj_real_rel, data_dict["seq_start_end_slstm"])
 
             # Compute loss with optional gradient penalty
             d_loss = self.d_loss_fn(scores_real, scores_fake)
@@ -107,33 +114,28 @@ class socialGAN(nn.Module):
             self.optimizer_d.step()
 
         g_loss = 0
-        loss_mask = data_dict["loss_mask"][:, self.obs_len:]
+        #loss_mask = data_dict["loss_mask"][:, self.obs_len:]
+        bs, t, _ = data_dict["gt_st_slstm"].shape
+        loss_mask = torch.ones(bs, t).cuda()
         g_l2_loss_rel = []
         for _ in range(self.best_k):
             data_dict = self.predict(data_dict)
-
             if self.l2_loss_weight > 0:
                 g_l2_loss_rel.append(self.l2_loss_weight * l2_loss(
-                    data_dict[("pred_rel", 0)],
-                    data_dict["gt_rel"],
+                    data_dict[("pred_st_slstm_rel", 0)],
+                    data_dict["gt_st_slstm_rel"],
                     loss_mask,
                     mode='raw'))
         
-        g_l2_loss_sum_rel = torch.zeros(1).to(data_dict["gt_rel"])
         if self.l2_loss_weight > 0:
             g_l2_loss_rel = torch.stack(g_l2_loss_rel, dim=1)
-            for start, end in data_dict["seq_start_end"].data:
-                _g_l2_loss_rel = g_l2_loss_rel[start:end]
-                _g_l2_loss_rel = torch.sum(_g_l2_loss_rel, dim=0)
-                _g_l2_loss_rel = torch.min(_g_l2_loss_rel) / torch.sum(
-                    loss_mask[start:end])
-                g_l2_loss_sum_rel += _g_l2_loss_rel
-            g_loss += g_l2_loss_sum_rel
+            g_l2_loss_rel = torch.min(g_l2_loss_rel, dim=1)[0]
+            g_loss += g_l2_loss_rel.mean()
 
-        traj_fake = torch.cat([data_dict["obs"], data_dict[("pred", 0)]], dim=0)
-        traj_fake_rel = torch.cat([data_dict["obs_rel"], data_dict[("pred_rel", 0)]], dim=0)
+        traj_fake = torch.cat([data_dict["obs_st_slstm"].permute(1, 0, 2), data_dict[("pred_st_slstm", 0)].permute(1, 0, 2)], dim=0)
+        traj_fake_rel = torch.cat([data_dict["obs_st_slstm_rel"].permute(1, 0, 2), data_dict[("pred_st_slstm_rel", 0)].permute(1, 0, 2)], dim=0)
 
-        scores_fake = self.d(traj_fake, traj_fake_rel, data_dict["seq_start_end"])
+        scores_fake = self.d(traj_fake, traj_fake_rel, data_dict["seq_start_end_slstm"])
         discriminator_loss = self.g_loss_fn(scores_fake)
 
         g_loss += discriminator_loss
@@ -180,9 +182,10 @@ class socialGAN(nn.Module):
             self.optimizer_g.load_state_dict(ckpt['g_optim_state'])
             self.optimizer_d.load_state_dict(ckpt['d_optim_state'])
 
-            optimizer_to_cuda(self.optimizer_g)
-            optimizer_to_cuda(self.optimizer_d)
+            optimizer_to_device(self.optimizer_g, self.device)
+            optimizer_to_device(self.optimizer_d, self.device)
+            return ckpt["epoch"]
         except KeyError:
             print("skip loading discriminator model weights")
 
-        return ckpt["epoch"]
+        

@@ -1,0 +1,8 @@
+MODEL:
+  TYPE: fastpredNF
+
+DATA:
+  DATASET_NAME: "zara2"
+
+SOLVER:
+  USE_SCHEDULER: True

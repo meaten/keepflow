@@ -1,0 +1,8 @@
+MODEL:
+  TYPE: fastpredNF_CIF
+
+DATA:
+  DATASET_NAME: "univ"
+
+SOLVER:
+  USE_SCHEDULER: True

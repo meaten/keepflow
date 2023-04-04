@@ -11,13 +11,13 @@ import torch.nn.functional as F
 import torch.optim as optim
 from torch.distributions import Normal
 
-from utils import optimizer_to_cuda
+from utils import optimizer_to_device
 
 
 class ARFlow(nn.Module):
     def __init__(self, cfg: CfgNode) -> None:
         super(ARFlow, self).__init__()
-        
+        self.device = cfg.DEVICE
         self.output_path = Path(cfg.OUTPUT_DIR)
 
         self.obs_len = cfg.DATA.OBSERVE_LENGTH
@@ -203,7 +203,7 @@ class ARFlow(nn.Module):
         self.load_state_dict(ckpt['state'])
 
         self.optimizer.load_state_dict(ckpt['optim_state'])
-        optimizer_to_cuda(self.optimizer)
+        optimizer_to_device(self.optimizer, self.device)
     
         return ckpt['epoch']
     

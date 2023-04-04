@@ -3,6 +3,12 @@ MODEL:
 
 DATA:
   DATASET_NAME: "simcross"
-
+  TP:
+    STATE: state_p
+    PRED_STATE: state_p
 SOLVER:
-  ITER: 100
+  USE_SCHEDULER: True
+  ITER: 500
+
+TEST:
+  KDE: True

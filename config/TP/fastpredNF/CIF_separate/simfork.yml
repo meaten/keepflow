@@ -1,0 +1,9 @@
+MODEL:
+  TYPE: fastpredNF_CIF_separate
+
+DATA:
+  DATASET_NAME: "simfork"
+
+SOLVER:
+  USE_SCHEDULER: True
+  

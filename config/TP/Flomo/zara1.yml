@@ -1,0 +1,14 @@
+MODEL:
+  TYPE: Flomo
+
+DATA:
+  DATASET_NAME: "zara1"
+  TP:
+    STATE: state_p
+    PRED_STATE: state_v
+
+SOLVER:
+  USE_SCHEDULER: True
+
+TEST:
+  KDE: True
