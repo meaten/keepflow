@@ -1,5 +1,0 @@
-MODEL:
-  TYPE: ARFlow
-
-DATA:
-  DATASET_NAME: "zara1"

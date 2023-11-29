@@ -1,0 +1,14 @@
+MODEL:
+  TYPE: Flomo
+
+DATA:
+  DATASET_NAME: "simcross"
+  TRAJ:
+    STATE: state_p
+    PRED_STATE: state_v
+SOLVER:
+  USE_SCHEDULER: True
+  ITER: 100
+
+TEST:
+  KDE: True

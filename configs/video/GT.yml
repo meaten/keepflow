@@ -1,0 +1,9 @@
+DATA:
+  TASK: "video"
+  DATASET_NAME: "smmnist"
+  OBSERVE_LENGTH: 5
+  PREDICT_LENGTH: 10
+  BATCH_SIZE: 100
+  
+MODEL:
+  TYPE: "GT"

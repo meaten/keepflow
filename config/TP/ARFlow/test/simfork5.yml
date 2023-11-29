@@ -1,8 +1,0 @@
-MODEL:
-  TYPE: ARFlow
-
-DATA:
-  DATASET_NAME: "simfork"
-  PREDICT_LENGTH: 3
-SOLVER:
-  USE_SCHEDULER: True

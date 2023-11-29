@@ -1,8 +1,0 @@
-MODEL:
-  TYPE: fastpredNF_CIF_separate
-
-DATA:
-  DATASET_NAME: "simcross"
-
-SOLVER:
-  USE_SCHEDULER: True

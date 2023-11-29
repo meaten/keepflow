@@ -1,0 +1,8 @@
+MODEL:
+  TYPE: FlowChain_CIF_separate
+
+DATA:
+  DATASET_NAME: "univ"
+
+SOLVER:
+  USE_SCHEDULER: True

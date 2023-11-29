@@ -1,8 +1,0 @@
-MODEL:
-  TYPE: fastpredNF_separate
-
-DATA:
-  DATASET_NAME: "univ"
-
-SOLVER:
-  USE_SCHEDULER: True

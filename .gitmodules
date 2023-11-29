@@ -1,0 +1,12 @@
+[submodule "extern/Trajectron-plus-plus"]
+	path = extern/traj/trajectron
+	url = https://github.com/StanfordASL/Trajectron-plus-plus.git
+[submodule "extern/traj/MID"]
+	path = extern/traj/MID
+	url = https://github.com/Gutianpei/MID
+[submodule "extern/traj/flomo_motion_prediction"]
+	path = extern/traj/flomo_motion_prediction
+	url = https://github.com/cschoeller/flomo_motion_prediction.git
+[submodule "extern/traj/LED"]
+	path = extern/traj/LED
+	url = https://github.com/MediaBrain-SJTU/LED.git

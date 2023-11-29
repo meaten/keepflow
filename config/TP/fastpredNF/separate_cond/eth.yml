@@ -1,8 +1,0 @@
-MODEL:
-  TYPE: fastpredNF_separate_cond
-
-DATA:
-  DATASET_NAME: "eth"
-
-SOLVER:
-  USE_SCHEDULER: True

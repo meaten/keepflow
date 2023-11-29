@@ -1,8 +1,0 @@
-MODEL:
-  TYPE: GT_Dist
-
-DATA:
-  DATASET_NAME: "simfork"
-  TP:
-    STATE: state_v
-    PRED_STATE: state_v

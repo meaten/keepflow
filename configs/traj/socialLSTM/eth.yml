@@ -1,0 +1,14 @@
+MODEL:
+  TYPE: socialLSTM
+
+DATA:
+  DATASET_NAME: "eth"
+  BATCH_SIZE: 64
+  TRAJ:
+    STATE: state_p
+    PRED_STATE: state_p
+    
+SOLVER:
+  USE_SCHEDULER: True
+  ITER: 50
+  SAVE_EVERY: 10

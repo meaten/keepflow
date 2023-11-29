@@ -1,0 +1,12 @@
+MODEL:
+  TYPE: socialLSTM
+
+DATA:
+  DATASET_NAME: "zara1"
+  BATCH_SIZE: 64
+  TRAJ:
+    STATE: state_p
+    PRED_STATE: state_p
+    
+SOLVER:
+  USE_SCHEDULER: True

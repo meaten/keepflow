@@ -1,0 +1,14 @@
+MODEL:
+  TYPE: MID
+
+DATA:
+  DATASET_NAME: "zara1"
+  TRAJ:
+    STATE: state_pva
+    PRED_STATE: state_v
+
+SOLVER:
+  USE_SCHEDULER: True
+
+TEST:
+  KDE: True

@@ -1,0 +1,14 @@
+MODEL:
+  TYPE: LED
+
+DATA:
+  DATASET_NAME: "univ"
+  TRAJ:
+    STATE: state_pva
+    PRED_STATE: state_p
+  
+SOLVER:
+  USE_SCHEDULER: True
+
+TEST:
+  KDE: True

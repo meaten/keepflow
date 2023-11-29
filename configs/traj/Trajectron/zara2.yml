@@ -1,0 +1,11 @@
+MODEL:
+  TYPE: Trajectron
+
+DATA:
+  DATASET_NAME: "zara2"
+  TRAJ:
+    STATE: state_pva
+    PRED_STATE: state_v
+
+SOLVER:
+  USE_SCHEDULER: True

@@ -1,0 +1,17 @@
+MODEL:
+  TYPE: FlowChain_CIF_separate_cond
+  ENCODER_TYPE: trajectron
+
+DATA:
+  DATASET_NAME: "simfork"
+  PREDICT_LENGTH: 10
+  OBSERVE_LENGTH: 10
+  TRAJ:
+    PRED_STATE: 'state_v'
+    ACCEPT_NAN: False
+    
+SOLVER:
+  USE_SCHEDULER: True
+  WEIGHT_DECAY: 0.0
+  ITER: 500
+  

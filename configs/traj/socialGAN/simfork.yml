@@ -1,0 +1,15 @@
+MODEL:
+  TYPE: socialGAN
+
+DATA:
+  DATASET_NAME: "simfork"
+  TRAJ:
+    STATE: state_p
+    PRED_STATE: state_p
+SOLVER:
+  USE_SCHEDULER: True
+  ITER: 500
+  SAVE_EVERY: 10
+
+TEST:
+  KDE: True

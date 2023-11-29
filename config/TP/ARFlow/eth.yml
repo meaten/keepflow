@@ -1,8 +1,0 @@
-MODEL:
-  TYPE: ARFlow
-
-DATA:
-  DATASET_NAME: "eth"
-
-SOLVER:
-  VALIDATION: False

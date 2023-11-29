@@ -1,8 +1,0 @@
-MODEL:
-  TYPE: fastpredNF_CIF
-
-DATA:
-  DATASET_NAME: "eth"
-
-SOLVER:
-  USE_SCHEDULER: True

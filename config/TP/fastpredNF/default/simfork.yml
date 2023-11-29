@@ -1,8 +1,0 @@
-MODEL:
-  TYPE: fastpredNF
-
-DATA:
-  DATASET_NAME: "simfork"
-
-SOLVER:
-  USE_SCHEDULER: True

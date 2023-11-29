@@ -1,0 +1,8 @@
+MODEL:
+  TYPE: FlowChain_CIF
+
+DATA:
+  DATASET_NAME: "hotel"
+
+SOLVER:
+  USE_SCHEDULER: True

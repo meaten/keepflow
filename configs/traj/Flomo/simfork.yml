@@ -1,0 +1,15 @@
+MODEL:
+  TYPE: Flomo
+
+DATA:
+  DATASET_NAME: "simfork"
+  TRAJ:
+    STATE: state_p
+    PRED_STATE: state_v
+SOLVER:
+  USE_SCHEDULER: True
+  ITER: 100
+  SAVE_EVERY: 10
+
+TEST:
+  KDE: True

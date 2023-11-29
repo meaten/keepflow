@@ -1,0 +1,16 @@
+DATA:
+  TASK: "video"
+  DATASET_NAME: "mnist"
+  OBSERVE_LENGTH: 10
+  PREDICT_LENGTH: 10
+  BATCH_SIZE: 64
+
+MODEL:
+  TYPE: "PredRNN"
+
+SOLVER:
+  ITER: 64
+  SAVE_EVERY: 8
+  
+TEST:
+  N_TRIAL: 1

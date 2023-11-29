@@ -1,0 +1,8 @@
+MODEL:
+  TYPE: FlowChain_separate_cond
+
+DATA:
+  DATASET_NAME: "simline"
+
+SOLVER:
+  USE_SCHEDULER: True

@@ -1,0 +1,17 @@
+MODEL:
+  TYPE: FlowChain_CIF_separate_cond
+  ENCODER_TYPE: trajectron
+
+DATA:
+  DATASET_NAME: "simfork"
+  BATCH_SIZE: 128
+  TRAJ:
+    PRED_STATE: 'state_v'
+    ACCEPT_NAN: True
+    
+SOLVER:
+  LR: 1e-4
+  USE_SCHEDULER: True
+  WEIGHT_DECAY: 0.0
+  ITER: 500
+  

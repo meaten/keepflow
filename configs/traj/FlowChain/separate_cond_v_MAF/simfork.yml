@@ -1,0 +1,15 @@
+MODEL:
+  TYPE: FlowChain_separate_cond
+  FLOW:
+    ARCHITECTURE: 'MAF'
+
+DATA:
+  DATASET_NAME: "simfork"
+  TP:
+    PRED_STATE: 'state_v'
+    
+SOLVER:
+  USE_SCHEDULER: True
+  WEIGHT_DECAY: 0.0
+  ITER: 500
+  

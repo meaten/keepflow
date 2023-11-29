@@ -1,8 +1,0 @@
-MODEL:
-  TYPE: COPY_LAST
-
-DATA:
-  DATASET_NAME: "simline"
-  TP:
-    STATE: state_p
-    PRED_STATE: state_p

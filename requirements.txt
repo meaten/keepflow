@@ -4,11 +4,13 @@ numpy
 pillow
 scipy
 scikit-image
-torch
-torchvision
+#torch
+#torchvision
 kornia
-wandb
 torchfile
+pyquaternion
+descartes
+shapely==1.7.1
 
 matplotlib
 seaborn
