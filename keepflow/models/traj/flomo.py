@@ -142,19 +142,22 @@ class FloMo(ModelTemplate):
             return samples_abs, log_probs
 
     def log_prob(self, y_true, x):
-        z, log_abs_jacobian_det = self._inverse(y_true, x)
+        mask = ~(torch.isnan(y_true).sum([1, 2]) > 0)
+        z, log_abs_jacobian_det = self._inverse(y_true.nan_to_num(), x.nan_to_num())
         normal = Normal(0, 1, validate_args=True)
-        return normal.log_prob(z).sum(1) + log_abs_jacobian_det
+        return ((normal.log_prob(z)).sum(1) + log_abs_jacobian_det) * mask
     
     def predict(self, data_dict, return_prob=False):
-        x = data_dict["obs_st"]
+        x = data_dict["obs"].nan_to_num()
         n = 10000 if return_prob else 1
         traj_pred, _ = self.sample(n, x)
-        data_dict[("pred_st", 0)] = traj_pred[:, 0]
+        # data_dict[("pred_st", 0)] = traj_pred[:, 0]
+        data_dict[("pred", 0)] = traj_pred[:, 0]
         
         if return_prob:
             traj_pred = torch.cat([traj_pred, torch.zeros_like(traj_pred)], dim=3)
-            data_dict[("prob_st", 0)] = traj_pred[..., :3]
+            # data_dict[("prob_st", 0)] = traj_pred[..., :3]
+            data_dict[("prob", 0)] = traj_pred[..., :3]
             
         return data_dict
     
@@ -162,8 +165,8 @@ class FloMo(ModelTemplate):
         return data_dict
     
     def update(self, data_dict):
-        x = data_dict["obs_st"]
-        y_true = data_dict["gt_st"]
+        x = data_dict['obs']
+        y_true = data_dict['gt']
         train_loss = -self.log_prob(y_true, x).mean()
         
         self.optimizer.zero_grad()

@@ -10,3 +10,6 @@
 [submodule "extern/traj/LED"]
 	path = extern/traj/LED
 	url = https://github.com/MediaBrain-SJTU/LED.git
+[submodule "extern/traj/JRDB-Traj"]
+	path = extern/traj/jrdb_traj
+	url = https://github.com/vita-epfl/JRDB-Traj.git

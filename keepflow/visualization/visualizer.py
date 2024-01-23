@@ -10,7 +10,7 @@ class Visualizer(ABC):
     def __init__(self, cfg: CfgNode):
         self.output_dir = Path(cfg.SAVE_DIR) / "visualize"
         self.output_dir.mkdir(exist_ok=True)
-
+        
     @abstractmethod
     def __call__(self, dict_list: List[Dict]) -> None:
         pass

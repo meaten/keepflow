@@ -4,5 +4,5 @@ MODEL:
 DATA:
   DATASET_NAME: "sdd"
   TRAJ:
-    STATE: state_p
+    STATE: state_pva
     PRED_STATE: state_p

@@ -14,8 +14,6 @@ from keepflow.models.motion import build_motion_pred_model
 def build_model(cfg: CfgNode) -> nn.Module:
     if cfg.MODEL.TYPE == "GT":
         return GT(cfg)
-    elif cfg.MODEL.TYPE == "COPY_LAST":
-        return COPY_LAST(cfg)
 
     if cfg.DATA.TASK == "traj":
         return build_traj_pred_model(cfg)
@@ -72,7 +70,7 @@ class ModelTemplate(nn.Module):
         self.load_state_dict(ckpt['state'])
 
         self.optimizer.load_state_dict(ckpt['optim_state'])
-    
+        
         return ckpt['epoch']
     
     def check_saved_path(self, path: Path = None) -> bool:
@@ -93,15 +91,3 @@ class GT(ModelTemplate):
     def load(self, path: Path = None) -> int:
         pass
     
-
-class COPY_LAST(ModelTemplate):
-    def predict(self, data_dict, return_prob=False) -> Dict:
-        size = data_dict["gt"].size()
-        data_dict[("pred", 0)] = data_dict["obs"][:, -1:].expand(size).contiguous()
-        return data_dict
-    
-    def save(self, epoch: int = 0, path: Path = None) -> None:
-        pass
-    
-    def load(self, path: Path = None) -> int:
-        pass

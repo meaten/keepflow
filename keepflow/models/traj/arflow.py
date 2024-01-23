@@ -34,7 +34,7 @@ class ARFlow(ModelTemplate):
         n_hidden = 2
         hidden_size = 64
         dequantize = False
-        self.scaling = True
+        self.scaling = False
         prediction_length = self.pred_len
         
         self.encoder_input = nn.Linear(self.input_size, self.d_model)
@@ -90,8 +90,9 @@ class ARFlow(ModelTemplate):
 
     def predict(self, data_dict: Dict, return_prob=False) -> Dict:
         inputs = torch.cat([data_dict['obs'], data_dict['gt']], dim=1).transpose(1, 0)
-
-        enc_inputs = inputs[: self.obs_len, ...]
+        gt = data_dict['gt'].transpose(1, 0)
+        
+        enc_inputs = torch.nan_to_num(inputs[: self.obs_len, ...])
         dec_inputs = enc_inputs[-1][None]
         
         _, scale = self.scaler(enc_inputs)
@@ -108,6 +109,7 @@ class ARFlow(ModelTemplate):
         sample = dec_inputs
         prob_map = []
         preds = []
+        gt_traj_log_prob = []
         current_dec_inputs = []
         
         for k in range(self.pred_len):
@@ -116,25 +118,33 @@ class ARFlow(ModelTemplate):
                 self.decoder_input(torch.cat(current_dec_inputs, dim=0)),
                 enc_out)[-1][None]
             sample_num = 10000
-            dist_args = self.dist_args_proj(dec_output).expand(sample_num, -1, -1)
+            dist_args = self.dist_args_proj(dec_output)
         
-            pos, log_prob = self.flow.sample_with_log_prob(cond=dist_args)
+            pos, log_prob = self.flow.sample_with_log_prob(cond=dist_args.expand(sample_num, -1, -1))
             pos_log_prob = torch.cat([pos, torch.exp(log_prob)[..., None]], dim=-1)
             prob_map.append(pos_log_prob[None, ...])
             sample = pos[-1:]
             preds.append(sample)
+            
+            if return_prob:
+                gt_traj_log_prob.append(self.flow.log_prob(gt[k, None], dist_args))
         
         preds = torch.cat(preds, dim=0).transpose(1, 0)
-        prob_map = torch.cat(prob_map, dim=0).transpose(2, 0)
         data_dict[("pred", 0)] = preds
-        data_dict[("prob", 0)] = prob_map
+        if return_prob:
+            prob_map = torch.cat(prob_map, dim=0).transpose(2, 0)
+            gt_traj_log_prob = torch.cat(gt_traj_log_prob, dim=0).transpose(1, 0)
+            data_dict[("prob", 0)] = prob_map
+            data_dict[('gt_traj_log_prob', 0)] = gt_traj_log_prob
         return data_dict
 
     def update(self, data_dict: Dict) -> Dict:
         inputs = torch.cat([data_dict['obs'], data_dict['gt']], dim=1).transpose(1, 0)
 
-        enc_inputs = inputs[: self.obs_len, ...]
+        enc_inputs = torch.nan_to_num(inputs[: self.obs_len, ...])
         dec_inputs = inputs[self.obs_len-1 : -1, ...]
+        mask_inputs = ~torch.isnan(dec_inputs)
+        dec_inputs = torch.nan_to_num(dec_inputs)
         
         _, scale = self.scaler(enc_inputs)
         if self.scaling:
@@ -162,8 +172,11 @@ class ARFlow(ModelTemplate):
         if self.dequantize:
             gt += torch.rand_like(data_dict['gt'])
         gt = gt.transpose(1, 0)
+        mask_gt = ~torch.isnan(gt)
+        gt = torch.nan_to_num(gt)
         
         loss = -self.flow.log_prob(gt, dist_args)
+        loss *= (mask_gt * mask_inputs)[..., 0]
         loss = loss.mean()
         
         self.optimizer.zero_grad()

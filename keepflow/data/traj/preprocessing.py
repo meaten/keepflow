@@ -28,14 +28,20 @@ def dict_collate(batch):
     
     out = {
         "index": index,
-        "obs": x_t,
-        "gt": y_t,
-        "obs_st": x_st_t,
-        "gt_st": y_st_t,
-        "neighbors_st": neighbors_data_st,
-        "neighbors_gt_st": neighbors_gt_st,
-        "neighbors_edge": neighbors_edge_value,
-        "robot_traj_st": robot_traj_st_t,
+        # "obs": x_t,
+        # "gt": y_t,
+        "obs": x_st_t,
+        "gt": y_st_t,
+        # "obs_st": x_st_t,
+        # "gt_st": y_st_t,
+        # "neighbors_st": restore(neighbors_data_st),
+        # "neighbors_gt_st": restore(neighbors_gt_st),
+        "neighbors": torch.Tensor([]),  # only for synthesized data, value should be []
+        "neighbors_gt": torch.Tensor([]),  # only for synthesized data, value should be []
+        'agent_type': torch.Tensor([2] * len(x_st_t)),  # only for synthesized data, value should be []
+        "neighbor_type": torch.Tensor([]),  # only for synthesized data, value should be []
+        "curr_state": x_t[:, -1],
+        "robot_traj": robot_traj_st_t,
         "map": map_tuple,
         "dt": dt,
         "first_history_index": first_history_index,
@@ -75,7 +81,7 @@ def collate(batch):
     
     elif isinstance(elem, NodeType):
         return batch
-        
+    
     return default_collate(batch)
 
 
@@ -83,7 +89,7 @@ def get_relative_robot_traj(env, state, node_traj, robot_traj, node_type, robot_
     # TODO: We will have to make this more generic if robot_type != node_type
     # Make Robot State relative to node
     _, std = env.get_standardize_params(state[robot_type], node_type=robot_type)
-    std[0:2] = env.attention_radius[(node_type, robot_type)]
+    # std[0:2] = env.attention_radius[(node_type, robot_type)]
     robot_traj_st = env.standardize(robot_traj,
                                     state[robot_type],
                                     node_type=robot_type,
@@ -124,7 +130,7 @@ def get_node_timestep_data(env, scene, t, node, state, pred_state,
     first_history_index = (max_ht - node.history_points_at(t)).clip(0)
 
     _, std = env.get_standardize_params(state[node.type], node.type)
-    std[0:2] = env.attention_radius[(node.type, node.type)]
+    # std[0:2] = env.attention_radius[(node.type, node.type)]
     rel_state = np.zeros_like(x[0])
     rel_state[0:2] = np.array(x)[-1, 0:2]
     x_st = env.standardize(x, state[node.type], node.type, mean=rel_state, std=std)
@@ -172,7 +178,7 @@ def get_node_timestep_data(env, scene, t, node, state, pred_state,
 
                 # Make State relative to node where neighbor and node have same state
                 _, std = env.get_standardize_params(state[connected_node.type], node_type=connected_node.type)
-                std[0:2] = env.attention_radius[edge_type]
+                # std[0:2] = env.attention_radius[edge_type]
                 equal_dims = np.min((neighbor_state_np.shape[-1], x.shape[-1]))
                 rel_state = np.zeros_like(neighbor_state_np)
                 rel_state[:, ..., :equal_dims] = x[-1, ..., :equal_dims]
@@ -182,7 +188,7 @@ def get_node_timestep_data(env, scene, t, node, state, pred_state,
                                                        mean=rel_state,
                                                        std=std)
                 _, std = env.get_standardize_params(pred_state[connected_node.type], node_type=connected_node.type)
-                std[0:2] = env.attention_radius[edge_type]
+                # std[0:2] = env.attention_radius[edge_type]
                 equal_dims = np.min((neighbor_gt_np.shape[-1], x.shape[-1]))
                 rel_state = np.zeros_like(neighbor_gt_np)
                 rel_state[:, ..., :equal_dims] = x[-1, ..., :equal_dims]

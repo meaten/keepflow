@@ -1,3 +1,4 @@
+import sys
 import torch
 from copy import deepcopy
 from yacs.config import CfgNode
@@ -5,7 +6,8 @@ from typing import Dict
 from pathlib import Path
 
 from keepflow.models import ModelTemplate
-
+sys.path.append('extern/traj/trajectron/trajectron')
+from model.components import GMM2D
 
 class GT_Dist(ModelTemplate):
     def __init__(self, cfg: CfgNode) -> None:
@@ -15,7 +17,6 @@ class GT_Dist(ModelTemplate):
         with open(env_path, 'rb') as f:
             train_env = dill.load(f, encoding='latin1')
             
-        from .components.gmm2d import GMM2D
         gt_dist = train_env.gt_dist
         assert gt_dist is not None, "environment does not have GT distributions"
         gt_dist = gt_dist.transpose(1, 0, 2)

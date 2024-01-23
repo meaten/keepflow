@@ -8,4 +8,5 @@ DATA:
     PRED_STATE: 'state_p'
 
 SOLVER:
-  VALIDATION: False
+  LR: 1e-5
+  USE_SCHEDULER: True

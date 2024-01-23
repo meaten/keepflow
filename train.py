@@ -25,12 +25,12 @@ def parse_args() -> argparse.Namespace:
 def train(cfg: CfgNode, save_model=True) -> None:        
     validation = cfg.SOLVER.VALIDATION and cfg.DATA.TASK != "video" 
     
-    data_loaders = build_dataloader(cfg, rand=True, split="train")
+    data_loader = build_dataloader(cfg, rand=True, split="train")
     # we don't have any validation set for Video Prediction
     if validation:
-        val_data_loaders = build_dataloader(cfg, rand=False, split="val")
-        val_loss = np.inf
-        
+        val_data_loader = build_dataloader(cfg, rand=False, split="val")
+        val_score = np.inf
+    
     start_epoch = 0
     model = build_model(cfg)
     
@@ -50,27 +50,26 @@ def train(cfg: CfgNode, save_model=True) -> None:
     with tqdm(range(start_epoch, cfg.SOLVER.ITER)) as pbar:
         for i in pbar:
             loss_list = []
-            for node_type, data_loader in data_loaders.items():
-                for data_dict in data_loader:
-                    data_dict = {k: data_dict[k].to(cfg.DEVICE) 
-                                if isinstance(data_dict[k], torch.Tensor)
-                                else data_dict[k]
-                                for k in data_dict}
-                    
-                    loss_list.append(model.update(data_dict))
-                    
+            for data_dict in tqdm(data_loader, leave=False):
+                data_dict = {k: data_dict[k].to(cfg.DEVICE) 
+                            if isinstance(data_dict[k], torch.Tensor)
+                            else data_dict[k]
+                            for k in data_dict}
+                
+                loss_list.append(model.update(deepcopy(data_dict)))
+                
             loss_info = aggregate(loss_list)
             pbar.set_postfix(OrderedDict(loss_info))
 
             # validation
             if (i+1) % cfg.SOLVER.SAVE_EVERY == 0:
                 if validation:
-                    result_metrics = evaluate_model(cfg, model, val_data_loaders)
+                    result_metrics = evaluate_model(cfg, model, val_data_loader)
                     print(result_metrics)
-                    curr_val_loss = result_metrics["score"]
+                    curr_val_score = result_metrics["score"]
 
-                    if curr_val_loss < val_loss:
-                        val_loss = curr_val_loss
+                    if curr_val_score < val_score:
+                        val_score = curr_val_score
                         if save_model:
                             model.save(epoch=i)
                 else:
@@ -79,10 +78,11 @@ def train(cfg: CfgNode, save_model=True) -> None:
             
             if cfg.SOLVER.USE_SCHEDULER:
                 [scheduler.step() for scheduler in schedulers]
-            
-    return val_loss
+                
+    if validation:
+        return val_score
 
-def evaluate_model(cfg: CfgNode, model: torch.nn.Module, data_loaders: Dict):
+def evaluate_model(cfg: CfgNode, model: torch.nn.Module, data_loader):
     model.eval()
     metrics = build_metrics(cfg)
     
@@ -90,20 +90,19 @@ def evaluate_model(cfg: CfgNode, model: torch.nn.Module, data_loaders: Dict):
 
     with torch.no_grad():
         result_list = []
-        for node_type, data_loader in data_loaders.items():
-            for i, data_dict in enumerate(tqdm(data_loader, leave=False)):
-                data_dict = {k: data_dict[k].to(cfg.DEVICE) 
-                            if isinstance(data_dict[k], torch.Tensor)
-                            else data_dict[k]
-                            for k in data_dict}
-                
-                dict_list = []
-                for _ in range(cfg.TEST.N_TRIAL):
-                    result_dict = model.predict(deepcopy(data_dict), return_prob=False)
-                    dict_list.append(deepcopy(result_dict))
-                
-                dict_list = metrics.denormalize(dict_list) 
-                result_list.append(deepcopy(metrics(dict_list)))
+        for i, data_dict in enumerate(tqdm(data_loader, leave=False)):
+            data_dict = {k: data_dict[k].to(cfg.DEVICE) 
+                        if isinstance(data_dict[k], torch.Tensor)
+                        else data_dict[k]
+                        for k in data_dict}
+            
+            dict_list = []
+            for _ in range(cfg.TEST.N_TRIAL):
+                result_dict = model.predict(data_dict, return_prob=False)
+                dict_list.append(deepcopy(result_dict))
+            
+            dict_list = metrics.denormalize(dict_list) 
+            result_list.append(deepcopy(metrics(dict_list)))
         d = aggregate(result_list)
         result_metrics.update({k: d[k] for k in d.keys() if d[k] != 0.0})
     
@@ -113,11 +112,9 @@ def evaluate_model(cfg: CfgNode, model: torch.nn.Module, data_loaders: Dict):
         
         
 def aggregate(dict_list: List[Dict]) -> Dict:
-    if "nsample" in dict_list[0]:
-        ret_dict = {k: np.sum([d[k] for d in dict_list], axis=0) / np.sum([d["nsample"] for d in dict_list]) for k in dict_list[0].keys()}
-    else:
-        ret_dict = {k: np.mean([d[k] for d in dict_list], axis=0) for k in dict_list[0].keys()}
-
+    ret_dict = {k: np.concatenate([d[k] if type(d[k]) == np.ndarray else [d[k]] for d in dict_list], axis=0) for k in dict_list[0].keys()}
+    ret_dict = {k: np.nanmean(ret_dict[k]) for k in ret_dict}
+    ret_dict = {k: float(ret_dict[k]) for k in ret_dict}
     return ret_dict
 
 

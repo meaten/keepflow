@@ -1,8 +1,33 @@
 from abc import ABC
-from typing import Optional
+from typing import Optional, List
 import math
+from copy import deepcopy
 import torch
 from torch import Tensor
+
+
+def kde(dict_list: List):
+    for data_dict in dict_list:
+        for k in list(data_dict.keys()):
+            if k[0] == "prob":
+                prob = data_dict[k]
+                batch_size, _, timesteps, _ = prob.shape
+                prob_, gt_traj_log_prob = [], []
+                for b in range(batch_size):
+                    prob__, gt_traj_prob__ = [], []
+                    for i in range(timesteps):
+                        kernel = GaussianKDE(prob[b, :, i, :-1])
+                        kernel(prob[b, :, i, :-1])  # estimate the prob of predicted future positions for fair comparison of inference time
+                        prob__.append(deepcopy(kernel))
+                        gt_traj_prob__.append(kernel(data_dict["gt"][b, None, i].float()))
+                    prob_.append(deepcopy(prob__))
+                    gt_traj_log_prob.append(torch.cat(gt_traj_prob__, dim=-1).log())
+                gt_traj_log_prob = torch.stack(gt_traj_log_prob, dim=0)
+                gt_traj_log_prob = torch.nan_to_num(gt_traj_log_prob, neginf=-10000)
+                data_dict[k] = prob_
+                data_dict[("gt_traj_log_prob", k[1])] = gt_traj_log_prob
+            
+    return dict_list
 
 
 class DynamicBufferModule(ABC, torch.nn.Module):

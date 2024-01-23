@@ -1,6 +1,5 @@
 MODEL:
   TYPE: FlowChain_CIF_separate_cond
-  ENCODER_TYPE: trajectron
 
 DATA:
   DATASET_NAME: "simline"

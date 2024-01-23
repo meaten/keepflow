@@ -5,6 +5,10 @@ def build_traj_pred_model(cfg: CfgNode):
     if cfg.MODEL.TYPE == "GT_Dist":
         from .gtdist import GT_Dist
         model = GT_Dist(cfg).to(cfg.DEVICE)
+        
+    if cfg.MODEL.TYPE == "COPY_LAST":
+        from .copy_last import COPY_LAST
+        model = COPY_LAST(cfg).to(cfg.DEVICE)
             
     elif cfg.MODEL.TYPE == "ARFlow":
         from .arflow import ARFlow

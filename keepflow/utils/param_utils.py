@@ -22,9 +22,13 @@ def load_config(args: argparse.Namespace, while_tuning: bool=False) -> CfgNode:
     if cfg_.LOAD_TUNED and not while_tuning:
         cfg_ = load_tuned_params(args, cfg_)
         
-    cfg_.DEVICE = args.device
+    # only to(device) cannot force trajdata on the specified device
     if args.device == "cpu":
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
+        cfg_.DEVICE = args.device
+    if "cuda" in args.device:
+        os.environ["CUDA_VISIBLE_DEVICES"] = args.device.split(":")[-1]
+        cfg_.DEVICE = "cuda:0"
     cfg_.freeze()
     
     print(f"output dirname: {cfg_.SAVE_DIR}")
@@ -41,7 +45,7 @@ def load_tuned_params(args: argparse.Namespace, cfg: CfgNode) -> CfgNode:
         return cfg
     
     study_path = os.path.join("sqlite:///", study_path)
-    print("load params from optuna database")
+    print("load hyperparameters from optuna database")
     study = optuna.load_study(storage=study_path, study_name="my_opt")
     trial_dict = study.best_trial.params
     

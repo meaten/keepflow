@@ -21,8 +21,8 @@ standardization = {
             'y': {'mean': 0, 'std': 1}
         },
         'velocity': {
-            'x': {'mean': 0, 'std': 2},
-            'y': {'mean': 0, 'std': 2}
+            'x': {'mean': 0, 'std': 1}, # 2 -> 1
+            'y': {'mean': 0, 'std': 1} 
         },
         'acceleration': {
             'x': {'mean': 0, 'std': 1},
@@ -102,7 +102,7 @@ maybe_makedirs(data_folder_name)
 
 data_columns = pd.MultiIndex.from_product([['position', 'velocity', 'acceleration'], ['x', 'y']])
 
-
+"""
 # Process ETH-UCY
 for desired_source in ['eth', 'hotel', 'univ', 'zara1', 'zara2']:
     for data_class in ['train', 'val', 'test']:
@@ -292,7 +292,7 @@ for data_class in ["train", "test"]:
         with open(data_out_path, 'wb') as f:
             #pdb.set_trace()
             dill.dump(env, f, protocol=dill.HIGHEST_PROTOCOL)
-
+"""
 
 # Process simulated dataset
 for desired_source in ['simline', 'simfork', 'simcross']:
@@ -381,6 +381,7 @@ for desired_source in ['simline', 'simfork', 'simcross']:
 
             x = node_values[:, 0]
             y = node_values[:, 1]
+            
             vx = derivative_of(x, scene.dt)
             vy = derivative_of(y, scene.dt)
             ax = derivative_of(vx, scene.dt)

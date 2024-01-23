@@ -4,5 +4,5 @@ MODEL:
 DATA:
   DATASET_NAME: "hotel"
   TRAJ:
-    STATE: state_v
+    STATE: state_pva
     PRED_STATE: state_v

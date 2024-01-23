@@ -1,13 +1,12 @@
 import os
 import argparse
-from typing import List, Dict
 from yacs.config import CfgNode
 import numpy as np
 import torch
 from copy import deepcopy
 from tqdm import tqdm
 
-from keepflow.utils import load_config, Timer, GaussianKDE
+from keepflow.utils import load_config, Timer, kde
 from keepflow.data import build_dataloader
 from keepflow.models import build_model
 from keepflow.metrics import build_metrics
@@ -65,48 +64,55 @@ def visualize(cfg, model: torch.nn.Module):
     with torch.no_grad():
         result_list = []
         print("timing the computation, evaluating probability map, and visualizing... ")
-        data_loaders = build_dataloader(cfg, rand=False, split = "test", batch_size=1)
-        for node_type, dataloader in data_loaders.items():
-            n_vis = 5
-            for i, data_dict in enumerate(tqdm(dataloader, total=n_vis)):
-                data_dict = {k: data_dict[k].to(cfg.DEVICE) 
-                            if isinstance(data_dict[k], torch.Tensor)
-                            else data_dict[k]
-                            for k in data_dict}
-                dict_list = []
+        data_loader = build_dataloader(cfg, rand=False, split = "test", batch_size=1)
+        n_vis = 10
+        prev_idx = None
+        count = 0
+        for data_dict in data_loader:
+            data_dict = {k: data_dict[k].to(cfg.DEVICE) 
+                        if isinstance(data_dict[k], torch.Tensor)
+                        else data_dict[k]
+                        for k in data_dict}
+            
+            if data_dict["index"][0][2] == prev_idx:
+                continue
+            else:
+                prev_idx = data_dict["index"][0][2]  # agent_id
+                count += 1
+                print(f"visualize {count} / {n_vis}")
+
+            result_dict = model.predict(deepcopy(data_dict), return_prob=True)  # warm-up
+            timer.start()
+            result_dict = model.predict(deepcopy(data_dict), return_prob=True)
+            timer.end()
+            curr_run_time = timer.elapsed_time()
+            run_times[0].append(curr_run_time)
                 
-                result_dict = model.predict(deepcopy(data_dict), return_prob=True)  # warm-up
+            for t in update_timesteps:
                 timer.start()
-                result_dict = model.predict(deepcopy(data_dict), return_prob=True)
+                result_dict = model.predict_from_new_obs(result_dict, t)
                 timer.end()
                 curr_run_time = timer.elapsed_time()
-                run_times[0].append(curr_run_time)
-                    
-                for t in update_timesteps:
-                    timer.start()
-                    result_dict = model.predict_from_new_obs(result_dict, t)
-                    timer.end()
-                    curr_run_time = timer.elapsed_time()
-                    run_times[t].append(curr_run_time)
-                    
-                dict_list.append(deepcopy(result_dict))
-                dict_list = metrics.denormalize(dict_list)  # denormalize the output
-                if cfg.TEST.KDE:
-                    timer.start()
-                    dict_list = kde(dict_list)
-                    timer.end()
-                    run_times[0][-1] += timer.elapsed_time()
+                run_times[t].append(curr_run_time)
+            
+            dict_list = [deepcopy(result_dict)]  # need to be list of dicts
+            dict_list = metrics.denormalize(dict_list)  # denormalize the output
+            if cfg.TEST.KDE:
                 timer.start()
-                dict_list = visualizer.prob_on_grid(dict_list)
+                dict_list = kde(dict_list)
                 timer.end()
                 run_times[0][-1] += timer.elapsed_time()
-                result_list.append(metrics(deepcopy(dict_list)))
-                
-                if visualize:
-                    visualizer(dict_list)
-                if i == n_vis - 1:
-                    break
-                
+            timer.start()
+            # dict_list = visualizer.prob_on_grid(dict_list)
+            timer.end()
+            run_times[0][-1] += timer.elapsed_time()
+            result_list.append(metrics(deepcopy(dict_list)))
+            
+            if visualize:
+                visualizer(dict_list)
+            if count == n_vis:
+                break
+            
         result_metrics.update(aggregate(result_list))
         
     print(f"execution time: {np.mean(run_times[0]):.2f} " + u"\u00B1" + f"{np.std(run_times[0]):.2f} [ms]")
@@ -130,30 +136,6 @@ def visualize(cfg, model: torch.nn.Module):
     model.train()
     
     return result_metrics
-        
-        
-def kde(dict_list: List):
-    for data_dict in dict_list:
-        for k in list(data_dict.keys()):
-            if k[0] == "prob":
-                prob = data_dict[k]
-                batch_size, _, timesteps, _ = prob.shape
-                prob_, gt_traj_log_prob = [], []
-                for b in range(batch_size):
-                    prob__, gt_traj_prob__ = [], []
-                    for i in range(timesteps):
-                        kernel = GaussianKDE(prob[b, :, i, :-1])
-                        kernel(prob[b, :, i, :-1])  # estimate the prob of predicted future positions for fair comparison of inference time
-                        prob__.append(deepcopy(kernel))
-                        gt_traj_prob__.append(kernel(data_dict["gt"][b, None, i].float()))
-                    prob_.append(deepcopy(prob__))
-                    gt_traj_log_prob.append(torch.cat(gt_traj_prob__, dim=-1).log())
-                gt_traj_log_prob = torch.stack(gt_traj_log_prob, dim=0)
-                gt_traj_log_prob = torch.nan_to_num(gt_traj_log_prob, neginf=-10000)
-                data_dict[k] = prob_
-                data_dict[("gt_traj_log_prob", k[1])] = gt_traj_log_prob
-            
-    return dict_list
 
 
 def main() -> None:

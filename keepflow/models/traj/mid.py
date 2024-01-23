@@ -4,15 +4,18 @@ from pathlib import Path
 from easydict import EasyDict
 import torch
 import torch.optim as optim
+from trajdata.data_structures import AgentType
 
 from keepflow.models import ModelTemplate
+from keepflow.utils import EmptyEnv
 sys.path.append('extern/traj/MID')
 from utils.model_registrar import ModelRegistrar
 from utils.trajectron_hypers import get_traj_hypers
 from models.trajectron import Trajectron
 from models.encoders import MultimodalGenerativeCVAE
 from models.autoencoder import AutoEncoder
-from dataset import restore
+import models.diffusion as diffusion
+from models.diffusion import DiffusionTraj, VarianceSchedule
 
 
 class MID(ModelTemplate):
@@ -27,101 +30,98 @@ class MID(ModelTemplate):
         self.hyperparams['enc_rnn_dim_edge_influence'] = self.config.encoder_dim//2
         self.hyperparams['enc_rnn_dim_history'] = self.config.encoder_dim//2
         self.hyperparams['enc_rnn_dim_future'] = self.config.encoder_dim//2
-        # self.hyperparams['state'] = self.hyperparams[cfg.DATA.TP.STATE]
-        # self.hyperparams['pred_state'] = self.hyperparams[cfg.DATA.TP.PRED_STATE]
-            
+                    
         self.registrar = ModelRegistrar(self.save_dir, self.device)
         
         self.encoder = Trajectron(self.registrar, self.hyperparams, self.device)
 
-        import dill
-        env_path = Path(cfg.DATA.PATH) / cfg.DATA.TASK / "processed_data" / f"{cfg.DATA.DATASET_NAME}_train.pkl"
-        with open(env_path, 'rb') as f:
-            train_env = dill.load(f, encoding='latin1')
-
-        self.encoder.set_environment(train_env)
+        env = EmptyEnv(cfg)
+        self.env = env
+        self.encoder.set_environment(env)
         self.encoder.set_annealing_params()
         
         self.model = CustomAutoEncoder(self.config, encoder=self.encoder)
         
-        self.pred_state = self.hyperparams['pred_state']
-        self.optimizer = dict()
-        for node_type in train_env.NodeType:
-            if node_type not in self.pred_state:
-                continue
-            self.optimizer[node_type] = optim.Adam([{'params': self.registrar.get_all_but_name_match('map_encoder').parameters()},
-                                                    # {'params': self.registrar.get_name_match('map_encoder').parameters(), 'lr':0.0008},
-                                                    {'params': self.model.parameters()}
-                                                    ],
-                                                   lr=self.config.lr)
+        self.optimizer = optim.Adam([{'params': self.registrar.get_all_but_name_match('map_encoder').parameters()},
+                                     {'params': self.model.parameters()}
+                                     ],
+                                    lr=self.config.lr)
         
-        self.optimizers = self.optimizer.values()
+        self.optimizers = [self.optimizer]
         
     def to(self, device):
         self.model.to(device)
         self.registrar.to(device)
         
     def eval(self):
-        self.model.eval()
-        self.registrar.eval()
-        
+        # self.model.eval()
+        # self.registrar.eval()
+        pass
         
     def train(self):
-        self.model.train()
-        self.registrar.train()
+        # self.model.train()
+        # self.registrar.train()
+        pass
+    
+    def create_batch(self, data_dict):
+        agent_type = data_dict['agent_type']
+        neighbor_type = data_dict['neighbor_type']
+        
+        neighbors = {edge_type : [] for edge_type in self.env.EdgeType}
+        neighbors_edge = {edge_type : [] for edge_type in self.env.EdgeType}
+        
+        for i in range(len(agent_type)):
+            for edge_type in neighbors.keys():
+                if AgentType[edge_type[0]].value == agent_type[i]:
+                    idx = torch.where(neighbor_type[i] == AgentType[edge_type[1]].value)
+                else:
+                    idx = []
+                
+                neighbors[edge_type].append(data_dict['neighbors'][i][idx])
+                neighbors_edge[edge_type].append(torch.ones_like(idx[0]))
+        
+        batch = (data_dict["first_history_index"],  # first_history_index
+                 data_dict["obs"],  # x_t
+                 data_dict["gt"],  # y_t
+                 data_dict["obs"],  # x_st_t
+                 data_dict["gt"],  # y_st_t
+                 neighbors,  # neighbors
+                 neighbors_edge,  # neighbor_edge
+                 data_dict["robot_traj"],
+                 data_dict["map"])
+        
+        return batch
     
     def predict(self, data_dict, return_prob=False):
-        batch = (data_dict["first_history_index"],
-                 data_dict["obs"],
-                 data_dict["gt"],
-                 data_dict["obs_st"],
-                 data_dict["gt_st"],
-                 restore(data_dict["neighbors_st"]),
-                 restore(data_dict["neighbors_edge"]),
-                 data_dict["robot_traj_st"],
-                 data_dict["map"])
+        batch = self.create_batch(data_dict)
         
         n_sample = 10000 if return_prob else 1
         
-        node_type = "PEDESTRIAN"
-        traj_pred = self.model.generate(batch, node_type, num_points=12, sample=n_sample, bestof=True)
+        node_type = str(AgentType(data_dict['agent_type'][0].item())).lstrip('AgentType.')  # assume all agnet types are the same in this minibatch
+        traj_pred = self.model.generate(batch, node_type, num_points=12, sample=n_sample, bestof=True, step=1)
         traj_pred = traj_pred.permute(1, 0, 2, 3)
         
-        data_dict[("pred_st", 0)] = traj_pred[:, 0]
+        data_dict[("pred", 0)] = traj_pred[:, 0]
         
         if return_prob:
             traj_pred = torch.cat([traj_pred, torch.zeros_like(traj_pred)], dim=3)
-            data_dict[("prob_st", 0)] = traj_pred[..., :3]
+            data_dict[("prob", 0)] = traj_pred[..., :3]
         
         return data_dict
     
     def predict_from_new_obs(self, data_dict, time_step: int):
-        # TODO: need to implement the density estimation & update
-        """
-        from data.TP.preprocessing import data_dict_to_next_step
-        data_dict_ = data_dict_to_next_step(data_dict, time_step)
-        data_dict_ = self.predict(data_dict_, return_prob=True)
-        data_dict[("pred_st", time_step)] = data_dict_[("pred_st", 0)][:, :-time_step]
-        data_dict[("prob_st", time_step)] = data_dict_[("prob_st", 0)][:, :-time_step]
-        """
+        # do nothing
         return data_dict
     
     def update(self, data_dict):
-        batch = (data_dict["first_history_index"],
-                 data_dict["obs"],
-                 data_dict["gt"],
-                 data_dict["obs_st"],
-                 data_dict["gt_st"],
-                 restore(data_dict["neighbors_st"]),
-                 restore(data_dict["neighbors_edge"]),
-                 data_dict["robot_traj_st"],
-                 data_dict["map"])
+        batch = self.create_batch(data_dict)
         
-        node_type = "PEDESTRIAN"
-        self.optimizer[node_type].zero_grad()
+        node_type = str(AgentType(data_dict['agent_type'][0].item())).lstrip('AgentType.')  # assume all agnet types are the same in this minibatch
+        self.optimizer.zero_grad()
+        
         train_loss = self.model.get_loss(batch, node_type)
         train_loss.backward()
-        self.optimizer[node_type].step()
+        self.optimizer.step()
         
         return {"loss": train_loss.item()}
     
@@ -133,7 +133,7 @@ class MID(ModelTemplate):
             'epoch': epoch,
             'encoder': self.registrar.model_dict,
             'model': self.model.state_dict(),
-            'optim_state': self.optimizer["PEDESTRIAN"].state_dict()
+            'optim_state': self.optimizer.state_dict()
         }
 
         torch.save(ckpt, path)
@@ -144,16 +144,40 @@ class MID(ModelTemplate):
         
         ckpt = torch.load(path, map_location=self.device)
         self.registrar.load_models(ckpt['encoder'])
+        
+        # craete new Trajectron with loaded weights
+        self.encoder = Trajectron(self.registrar, self.hyperparams, self.device)
+
+        self.encoder.set_environment(self.env)
+        self.encoder.set_annealing_params()
+        
+        # hand over Trajectron encoder with weights to ddpm model
+        self.model = CustomAutoEncoder(self.config, encoder=self.encoder)
+        self.model.to(self.device)
         self.model.load_state_dict(ckpt['model'])
-        try:
-            self.optimizer["PEDESTRIAN"].load_state_dict(ckpt['optim_state'])
-            epoch = ckpt["epoch"]
-        except KeyError:
-            epoch = 0
-            
+        
+        self.optimizer.load_state_dict(ckpt['optim_state'])
+        epoch = ckpt["epoch"]
+                    
         return epoch
     
 class CustomAutoEncoder(AutoEncoder):
+    def __init__(self, config, encoder):
+        torch.nn.Module.__init__(self)
+        self.config = config
+        self.encoder = encoder
+        self.diffnet = getattr(diffusion, config.diffnet)
+
+        self.diffusion = CustomDiffusionTraj(
+            net = self.diffnet(point_dim=2, context_dim=config.encoder_dim, tf_layer=config.tf_layer, residual=False),
+            var_sched = VarianceSchedule(
+                num_steps=100,
+                beta_T=5e-2,
+                mode='linear'
+
+            )
+        )
+    
     def generate(self, batch, node_type, num_points, sample, bestof,flexibility=0.0, ret_traj=False, sampling="ddpm", step=100):
         # dynamics = self.encoder.node_models_dict[node_type].dynamic
         encoded_x = self.encoder.get_latent(batch, node_type)
@@ -171,5 +195,27 @@ class CustomAutoEncoder(AutoEncoder):
          map) = batch
         
         feat_x_encoded = self.encode(batch,node_type) # B * 64
-        loss = self.diffusion.get_loss(y_st_t.cuda(), feat_x_encoded)  # y_t -> y_st_t
+        loss = self.diffusion.get_loss(y_st_t, feat_x_encoded)  # y_t -> y_st_t
         return loss
+    
+    
+class CustomDiffusionTraj(DiffusionTraj):
+    def get_loss(self, x_0, context, t=None):
+
+        batch_size, _, point_dim = x_0.size()
+        if t == None:
+            t = self.var_sched.uniform_sample_t(batch_size)
+
+        alpha_bar = self.var_sched.alpha_bars[t]
+        beta = self.var_sched.betas[t].to(x_0.device)
+
+        c0 = torch.sqrt(alpha_bar).view(-1, 1, 1).to(x_0.device)       # (B, 1, 1)
+        c1 = torch.sqrt(1 - alpha_bar).view(-1, 1, 1).to(x_0.device)   # (B, 1, 1)
+
+        e_rand = torch.randn_like(x_0).to(x_0.device) # (B, N, d)
+
+        mask = ~(torch.isnan(x_0).sum(dim=1, keepdim=True) > 0)
+        e_theta = self.net(c0 * x_0.nan_to_num() + c1 * e_rand, beta=beta, context=context)
+        loss = (e_theta - e_rand) ** 2 
+        loss *= mask
+        return loss.mean()

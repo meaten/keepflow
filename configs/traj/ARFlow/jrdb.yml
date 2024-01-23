@@ -1,0 +1,12 @@
+MODEL:
+  TYPE: ARFlow
+
+DATA:
+  DATASET_NAME: "jrdb"
+  TRAJ:
+    STATE: 'state_p'
+    PRED_STATE: 'state_p'
+
+SOLVER:
+  LR: 1e-5
+  USE_SCHEDULER: True

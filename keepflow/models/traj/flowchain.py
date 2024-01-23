@@ -1,56 +1,55 @@
+import sys
 from yacs.config import CfgNode
-import math
 from pathlib import Path
-from typing import Tuple, Dict
+from typing import Dict
+import yaml
+from easydict import EasyDict
 import numpy as np
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
 from torch.distributions import Normal
+from trajdata.data_structures import AgentType
 
 from keepflow.models import ModelTemplate
-from keepflow.data.traj.preprocessing import restore
+from keepflow.utils import EmptyEnv
 
-from .TFCondARFlow import (
+from .arflow import (
     FlowSequential,
     LinearMaskedCoupling,
     BatchNorm,
     MADE
 )
 
+from .mid import (
+    get_traj_hypers,
+    ModelRegistrar,
+    Trajectron
+)
 
 class FlowChainTraj(ModelTemplate):
     def __init__(self, cfg: CfgNode) -> None:
         super().__init__(cfg)
         self.pred_state = cfg.DATA.TRAJ.PRED_STATE
         
-        from keepflow.data.traj.trajectron_dataset import get_hypers
-        hypers = get_hypers(cfg)
-
-        conditioning_length = cfg.MODEL.FLOW.CONDITIONING_LENGTH
-
-        encoder_dict = {
-            "transformer": TransformerEncoder,
-            "trajectron": TrajectronEncoder
-        }
+        with open("extern/traj/MID/configs/baseline.yaml") as f:
+            config = yaml.safe_load(f)
+        self.config = EasyDict(config)
+        self.hyperparams = get_traj_hypers()
+        self.hyperparams['enc_rnn_dim_edge'] = self.config.encoder_dim//2
+        self.hyperparams['enc_rnn_dim_edge_influence'] = self.config.encoder_dim//2
+        self.hyperparams['enc_rnn_dim_history'] = self.config.encoder_dim//2
+        self.hyperparams['enc_rnn_dim_future'] = self.config.encoder_dim//2
+                    
+        self.registrar = ModelRegistrar(self.save_dir, self.device)
         
-        import dill
-        env_path = Path(cfg.DATA.PATH) / cfg.DATA.TASK / "processed_data" / f"{cfg.DATA.DATASET_NAME}_train.pkl"
-        with open(env_path, 'rb') as f:
-            train_env = dill.load(f, encoding='latin1')
-        
-        self.encoder = nn.ModuleDict()
-        for node_type in train_env.NodeType:
-            input_size = int(np.sum([len(entity_dims) for entity_dims in hypers[cfg.DATA.TRAJ.STATE][node_type].values()]))    
-            self.encoder[node_type.name] = encoder_dict[cfg.MODEL.ENCODER_TYPE](
-                cfg=cfg,
-                input_size=input_size,
-                output_size=conditioning_length,
-                obs_len=self.obs_len,
-                pred_len=self.pred_len,
-                node_type=node_type
-            )
+        self.encoder = Trajectron(self.registrar, self.hyperparams, self.device)
+
+        env = EmptyEnv(cfg)
+        self.env = env
+        self.encoder.set_environment(env)
+        self.encoder.set_annealing_params()
 
         model_dict = {
             "FlowChain": FlowChain,
@@ -67,11 +66,15 @@ class FlowChainTraj(ModelTemplate):
         n_blocks = cfg.MODEL.FLOW.N_BLOCKS
         n_hidden = cfg.MODEL.FLOW.N_HIDDEN
         hidden_size = cfg.MODEL.FLOW.HIDDEN_SIZE
+        conditioning_length = \
+            self.hyperparams["enc_rnn_dim_history"] + \
+            self.hyperparams["enc_rnn_dim_edge"] * self.hyperparams["edge_encoding"] + \
+            self.hyperparams["enc_rnn_dim_future"] * self.hyperparams["incl_robot_node"]
 
         self.flow = nn.ModuleDict()
-        for node_type in train_env.NodeType:
-            output_size = int(np.sum([len(entity_dims) for entity_dims in hypers[cfg.DATA.TRAJ.PRED_STATE][node_type].values()]))
-            self.flow[node_type.name] = model_dict[cfg.MODEL.TYPE](
+        for node_type in env.NodeType:
+            output_size = 2
+            self.flow[node_type] = model_dict[cfg.MODEL.TYPE](
                 input_size=output_size,
                 n_blocks=n_blocks,
                 n_hidden=n_hidden,
@@ -85,6 +88,7 @@ class FlowChainTraj(ModelTemplate):
 
         decay_parameters = [
             n for n, p in self.named_parameters() if 'bias' not in n]
+        
         optimizer_grouped_parameters = [
             {
                 "params": [p for n, p in self.named_parameters() if n in decay_parameters],
@@ -93,7 +97,7 @@ class FlowChainTraj(ModelTemplate):
             {
                 "params": [p for n, p in self.named_parameters() if n not in decay_parameters],
                 "weight_decay": 0.0,
-            }
+            },
         ]
         
         self.optimizer = optim.Adam(
@@ -102,7 +106,42 @@ class FlowChainTraj(ModelTemplate):
 
         self.ldjs_tmp = None
         self.base_prob_normalizer_tmp = None
-
+        
+    def create_batch(self, data_dict):
+        agent_type = data_dict['agent_type']
+        neighbor_type = data_dict['neighbor_type']
+        
+        neighbors = {edge_type : [] for edge_type in self.env.EdgeType}
+        neighbors_edge = {edge_type : [] for edge_type in self.env.EdgeType}
+        
+        for i in range(len(agent_type)):
+            for edge_type in neighbors.keys():
+                if AgentType[edge_type[0]].value == agent_type[i]:
+                    idx = torch.where(neighbor_type[i] == AgentType[edge_type[1]].value)
+                else:
+                    idx = []
+                
+                neighbors[edge_type].append(data_dict['neighbors'][i][idx])
+                neighbors_edge[edge_type].append(torch.ones_like(idx[0]))
+        
+        batch = (data_dict["first_history_index"],  # first_history_index
+                 data_dict["obs"],  # x_t
+                 data_dict["gt"],  # y_t
+                 data_dict["obs"],  # x_st_t
+                 data_dict["gt"],  # y_st_t
+                 neighbors,  # neighbors
+                 neighbors_edge,  # neighbor_edge
+                 data_dict["robot_traj"],
+                 data_dict["map"])
+        
+        return batch
+    
+    def encode(self, data_dict: Dict, node_type):
+        batch = self.create_batch(data_dict)
+        encoded_x = self.encoder.get_latent(batch, node_type)
+        encoded_x = encoded_x[:, None].expand(-1, self.pred_len, -1)
+        return encoded_x
+    
     def predict(self, data_dict: Dict, return_prob: bool = True) -> Dict:
         if return_prob:
             return self.predict_inverse_prob(data_dict)
@@ -111,9 +150,9 @@ class FlowChainTraj(ModelTemplate):
         # return self.predict_forward(data_dict)
 
     def predict_inverse_prob(self, data_dict: Dict) -> Dict:
-        node = data_dict["this_node_type"][0].name
-        dist_args = self.encoder[node](data_dict)
-
+        node = str(AgentType(data_dict['agent_type'][0].item())).lstrip('AgentType.')  # assume all agnet types are the same in this minibatch
+        dist_args = self.encode(data_dict, node)
+    
         sample_num = 10000
 
         base_pos = self.get_base_pos(
@@ -126,23 +165,23 @@ class FlowChainTraj(ModelTemplate):
         self.ldjs_tmp = seq_ldjs
         self.base_prob_normalizer_tmp = base_log_prob.exp().sum(dim=1)
 
-        data_dict[("prob_st", 0)] = torch.cat(
+        data_dict[("prob", 0)] = torch.cat(
             [sampled_seq, log_prob[..., None]], dim=-1)
         """
         log_prob = torch.nan_to_num(log_prob, nan=-float('inf'))
         index_ML = log_prob[..., -1].argmax(dim=1)[:, None, None]
         index_ML = index_ML.expand(data_dict["gt"].size()).unsqueeze(1)
-        data_dict[("pred_st", 0)] = torch.gather(sampled_seq, 1, index_ML).squeeze(1)  # sample maximum likelihood
+        data_dict[("pred", 0)] = torch.gather(sampled_seq, 1, index_ML).squeeze(1)  # sample maximum likelihood
         """
-        data_dict[("pred_st", 0)] = sampled_seq[:, -1]
+        data_dict[("pred", 0)] = sampled_seq[:, -1]
         if False:
-            data_dict[("gt_traj_log_prob", 0)] = self.flow.log_prob_sequential(base_pos[:, 0], data_dict["gt_st"], dist_args[:, 0])
+            data_dict[("gt_traj_log_prob", 0)] = self.flow.log_prob_sequential(base_pos[:, 0], data_dict["gt"], dist_args[:, 0])
         return data_dict
 
     def predict_inverse_ML(self, data_dict: Dict) -> Dict:
-        node = data_dict["this_node_type"][0].name
-        dist_args = self.encoder[node](data_dict)
-
+        node = str(AgentType(data_dict['agent_type'][0].item())).lstrip('AgentType.')  # assume all agnet types are the same in this minibatch
+        dist_args = self.encode(data_dict, node)
+        
         sample_num = 100
 
         base_pos = self.get_base_pos(
@@ -150,58 +189,60 @@ class FlowChainTraj(ModelTemplate):
         dist_args = dist_args[:, None].expand(-1, sample_num, -1, -1)
         sampled_seq, log_prob, seq_ldjs, base_log_prob = self.flow[node].sample_with_log_prob(
             base_pos, cond=dist_args)
+        
         """
         log_prob = torch.nan_to_num(log_prob, nan=-float('inf'))
         index_ML = log_prob[..., -1].argmax(dim=1)[:, None, None]
-        index_ML = index_ML.expand(data_dict["gt_st"].size()).unsqueeze(1)
-        data_dict[("pred_st", 0)] = torch.gather(sampled_seq, 1,
+        index_ML = index_ML.expand(data_dict["gt"].size()).unsqueeze(1)
+        data_dict[("pred", 0)] = torch.gather(sampled_seq, 1,
                                                  index_ML).squeeze(1)  # sample maximum likelihood
         """
-        data_dict[("pred_st", 0)] = sampled_seq[:, -1]
-        if torch.sum(torch.isnan(data_dict[('pred_st', 0)])):
-            data_dict[("pred_st", 0)] = torch.where(torch.isnan(data_dict[("pred_st", 0)]),
-                                                    data_dict['obs_st'][:, 0, None, 2:4].expand(data_dict[("pred_st", 0)].size()),
-                                                    data_dict[('pred_st', 0)])
+        data_dict[("pred", 0)] = sampled_seq[:, -1]
+        if torch.sum(torch.isnan(data_dict[('pred', 0)])):
+            data_dict[("pred", 0)] = torch.where(torch.isnan(data_dict[("pred", 0)]),
+                                                    data_dict['obs'][:, 0, None, 2:4].expand(data_dict[("pred", 0)].size()),
+                                                    data_dict[('pred', 0)])
         return data_dict
 
     def predict_from_new_obs(self, data_dict: Dict, time_step: int) -> Dict:
-        node = data_dict["this_node_type"][0].name
+        node = str(AgentType(data_dict['agent_type'][0].item())).lstrip('AgentType.')  # assume all agnet types are the same in this minibatch
         assert 0 < time_step and time_step < self.pred_len, f"time_step for update need to be 0~{self.pred_len-1}, got {time_step}"
-        assert ("prob_st", 0) in data_dict.keys(), "Initial prediction needed before updating"
+        assert ("prob", 0) in data_dict.keys(), "Initial prediction needed before updating"
         
-        data_dict[("prob_st", time_step)] = data_dict[(
-            "prob_st", 0)][:, :, time_step:].clone()
+        data_dict[("prob", time_step)] = data_dict[(
+            "prob", 0)][:, :, time_step:].clone()
             
         base_log_prob = self.flow[node].base_dist(
-            data_dict["gt_st"][:, time_step-1], step=time_step).log_prob(data_dict[("prob_st", 0)][:, :, time_step-1, :2])
+            data_dict["gt"][:, time_step-1], step=time_step).log_prob(data_dict[("prob", 0)][:, :, time_step-1, :2])
         base_log_prob = torch.sum(base_log_prob, dim=-1)
         base_prob = base_log_prob.exp()
         base_log_prob = (base_prob / base_prob.sum(dim=1) * self.base_prob_normalizer_tmp).log()
         log_prob = base_log_prob[:, :, None] + \
             torch.cumsum(self.ldjs_tmp[:, :, time_step:], dim=0) / torch.cumsum(torch.ones_like(self.ldjs_tmp[:, :, time_step:]), dim=0) 
-        data_dict[("prob_st", time_step)][..., -1] = log_prob
+        data_dict[("prob", time_step)][..., -1] = log_prob
 
-        index_ML = data_dict[("prob_st", time_step)][:,:, -1, -1].argmax(dim=1)[:, None, None]
+        index_ML = data_dict[("prob", time_step)][:,:, -1, -1].argmax(dim=1)[:, None, None]
         index_ML = index_ML.expand(
-            data_dict["gt_st"][:, time_step:].size()).unsqueeze(1)
-        data_dict[("pred_st", time_step)] = torch.gather(data_dict[(
-            "prob_st", time_step)][..., :2], 1, index_ML).squeeze(1)  # sample maximum likelihood
+            data_dict["gt"][:, time_step:].size()).unsqueeze(1)
+        data_dict[("pred", time_step)] = torch.gather(data_dict[(
+            "prob", time_step)][..., :2], 1, index_ML).squeeze(1)  # sample maximum likelihood
         if False:
             dist_args = self.encoder(data_dict)
-            data_dict[("gt_traj_log_prob", time_step)] = self.flow.log_prob_sequential(data_dict["gt_st"][:, time_step-1],
-                                                                                       data_dict["gt_st"],
+            data_dict[("gt_traj_log_prob", time_step)] = self.flow.log_prob_sequential(data_dict["gt"][:, time_step-1],
+                                                                                       data_dict["gt"],
                                                                                        dist_args,
                                                                                        n_step=self.pred_len-time_step-1)
         return data_dict
-
+    
+    """
     def predict_forward(self, data_dict: Dict) -> Dict:
-        node = data_dict["this_node_type"][0].name
+        node = str(AgentType(data_dict['agent_type'][0].item())).lstrip('AgentType.')  # assume all agnet types are the same in this minibatch
         # not for *_cond models
         data_dict = self.predict_inverse(data_dict)  # for data_dict["pred"]
-        dist_args = self.encoder[node](data_dict)
+        dist_args = self.encode(data_dict, node)
 
         sample_num_per_dim = 200
-        batch_size = data_dict["obs_st"][-1].size()[0]
+        batch_size = data_dict["obs"][-1].size()[0]
         base_pos = self.get_base_pos(data_dict)[
             :, None].expand(-1, sample_num_per_dim ** self.output_size, -1).clone()
         dist_args = dist_args[:, None].expand(
@@ -211,184 +252,76 @@ class FlowChainTraj(ModelTemplate):
 
         log_prob = self.flow.log_prob_sequential(base_pos, seq, cond=dist_args)
 
-        data_dict[("prob_st", 0)] = torch.cat(
+        data_dict[("prob", 0)] = torch.cat(
             [seq, log_prob[..., None]], dim=-1)
         return data_dict
-
+    """
+    
     def update(self, data_dict: Dict) -> Dict:
-        node = data_dict["this_node_type"][0].name
-        dist_args = self.encoder[node](data_dict)
-
-        gt = data_dict['gt_st']
+        node = str(AgentType(data_dict['agent_type'][0].item())).lstrip('AgentType.')  # assume all agnet types are the same in this minibatch
+        dist_args = self.encode(data_dict, node)
+        
+        gt = data_dict['gt']
         if self.dequantize:
-            gt += torch.rand_like(data_dict['gt_st']) / 100
+            gt += torch.rand_like(data_dict['gt']) / 100
 
         base_pos = self.get_base_pos(data_dict)
-
-        loss = -self.flow[node].log_prob(base_pos, gt, dist_args)
+        
+        mask = ~torch.isnan(gt)[..., 0]
+        loss = -self.flow[node].log_prob(base_pos, gt.nan_to_num(), dist_args)
+        loss *= mask
         loss = loss.mean()
-
+        
         self.optimizer.zero_grad()
         loss.backward()
         #torch.nn.utils.clip_grad_norm_(self.parameters(), 10)
         self.optimizer.step()
-
+        
         return {'loss': loss.mean().item()}
 
     def get_base_pos(self, data_dict: Dict) -> torch.Tensor:
         # assume x_st contains {'position', 'velocity', 'acceleration'} info
         if self.pred_state == 'state_p':
-            return data_dict["obs_st"][:, -1, :2]
+            return data_dict["obs"][:, -1, :2]
         elif self.pred_state == 'state_v':
-            return data_dict["obs_st"][:, -1, 2:4]
-        elif self.pred_state == 'state_a':
-            return data_dict["obs_st"][:, -1, 4:6]
+            return data_dict["obs"][:, -1, 2:4]
         else:
             raise ValueError
+        
+    def save(self, epoch: int = 0, path: Path=None) -> None:
+        if path is None:
+            path = self.model_path
 
+        ckpt = {
+            'epoch': epoch,
+            'encoder': self.registrar.model_dict,
+            'flow': self.flow.state_dict(),
+            'optim_state': self.optimizer.state_dict()
+        }
 
-class TransformerEncoder(nn.Module):
-    def __init__(self,
-                 cfg: CfgNode,
-                 input_size: int,
-                 output_size: int,
-                 obs_len: int,
-                 pred_len: int,
-                 node_type):
-        super(TransformerEncoder, self).__init__()
+        torch.save(ckpt, path)
 
-        self.obs_len = obs_len
-        self.pred_len = pred_len
+    def load(self, path: Path=None) -> int:
+        if path is None:
+            path = self.model_path
+        
+        ckpt = torch.load(path, map_location=self.device)
+        self.registrar.load_models(ckpt['encoder'])
+        
+        # craete new Trajectron with loaded weights
+        self.encoder = Trajectron(self.registrar, self.hyperparams, self.device)
 
-        d_model = 16
-        num_heads = 4
-        num_encoder_layers = 3
-        num_decoder_layers = 3
-        dim_feedforward_scale = 4
-        dropout_rate = 0.1
-        act_type = "gelu"
-
-        self.encoder_input = nn.Linear(input_size, d_model)
-        self.decoder_input = nn.Linear(input_size, d_model)
-
-        # [B, T, d_model] where d_model / num_heads is int
-        self.transformer = nn.Transformer(
-            d_model=d_model,
-            nhead=num_heads,
-            num_encoder_layers=num_encoder_layers,
-            num_decoder_layers=num_decoder_layers,
-            dim_feedforward=dim_feedforward_scale * d_model,
-            dropout=dropout_rate,
-            activation=act_type,
-            batch_first=True
-        )
-
-        self.dist_args_proj = nn.Linear(d_model, output_size)
-
-        position = torch.arange(self.obs_len + self.pred_len).unsqueeze(1)
-        div_term = torch.exp(torch.arange(0, d_model, 2)
-                             * (-math.log(10000.0) / d_model))
-        pe = torch.zeros(1, self.obs_len + self.pred_len, d_model)
-        pe[0, :, 0::2] = torch.sin(position * div_term)
-        pe[0, :, 1::2] = torch.cos(position * div_term)
-        self.register_buffer("pe", pe)
-
-    def __call__(self, data_dict: Dict) -> torch.Tensor:
-        enc_inputs = data_dict["obs_st"]
-
-        enc_pe = self.pe[:, :self.obs_len]
-        dec_pe = self.pe[:, self.obs_len:]
-
-        enc_out = self.transformer.encoder(
-            self.encoder_input(enc_inputs) + enc_pe
-        )
-
-        dec_output = self.transformer.decoder(
-            dec_pe.expand(enc_out.shape[0], -1, -1),
-            enc_out
-        )
-
-        dist_args = self.dist_args_proj(dec_output)
-
-        return dist_args
+        self.encoder.set_environment(self.env)
+        self.encoder.set_annealing_params()
+        
+        self.flow.load_state_dict(ckpt['flow'])
+        
+        self.optimizer.load_state_dict(ckpt['optim_state'])
+        epoch = ckpt["epoch"]
+                    
+        return epoch
     
-
-class TrajectronEncoder(nn.Module):
-    def __init__(self,
-                 cfg: CfgNode,
-                 input_size: int,
-                 output_size: int,
-                 obs_len: int,
-                 pred_len: int,
-                 node_type):
-        super(TrajectronEncoder, self).__init__()
-        
-        self.obs_len = obs_len
-        self.pred_len = pred_len
-        
-        self.output_size = output_size
-        
-        self.device = cfg.DEVICE
-        
-        from .mid import MultimodalGenerativeCVAE, ModelRegistrar
-        from keepflow.data.traj.trajectron_dataset import get_hypers
-        hypers = get_hypers(cfg)
-        
-        import dill
-        env_path = Path(cfg.DATA.PATH) / cfg.DATA.TASK / "processed_data" / f"{cfg.DATA.DATASET_NAME}_train.pkl"
-        with open(env_path, 'rb') as f:
-            env = dill.load(f, encoding='latin1')
-            edge_types = env.get_edge_types()
-            
-        hypers['state'] = hypers[cfg.DATA.TRAJ.STATE]
-        
-        self.model_registrar = ModelRegistrar(cfg.SAVE_DIR, self.device)
-        
-        self.encoder = MultimodalGenerativeCVAE(
-            env,
-            node_type.name,
-            self.model_registrar,
-            hypers,
-            cfg.DEVICE,
-            edge_types
-        )
-        d_model = \
-            hypers["enc_rnn_dim_history"] + \
-            hypers["enc_rnn_dim_edge"] * hypers["edge_encoding"] + \
-            hypers["enc_rnn_dim_future"] * hypers["incl_robot_node"]
-        
-        self.dist_args_proj = nn.Linear(d_model, output_size)
-        
-    def __call__(self, data_dict: Dict) -> torch.Tensor:
-        inputs = data_dict["obs"]
-        inputs_st = data_dict["obs_st"]
-        first_history_indices = data_dict["first_history_index"]
-        labels = data_dict["gt"]
-        labels_st = data_dict["gt_st"]
-        neighbors = restore(data_dict["neighbors_gt_st"])
-        neighbors_edge_value = restore(data_dict["neighbors_edge"])
-        robot = None
-        map = None
-        prediction_horizon = None
-        
-        x = self.encoder.get_latent(
-            inputs,
-            inputs_st,
-            first_history_indices,
-            labels,
-            labels_st,
-            neighbors,
-            neighbors_edge_value,
-            robot,
-            map,
-            prediction_horizon
-        )
-        
-        dist_args = self.dist_args_proj(x)[:, None].expand(-1, self.pred_len, -1)
-        
-        return dist_args
-        
-
+    
 class FlowChain(nn.Module):
     def __init__(self,
                  input_size: int,

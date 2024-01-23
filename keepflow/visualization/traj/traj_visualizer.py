@@ -15,6 +15,7 @@ from scipy.interpolate import griddata, RBFInterpolator, interp2d
 from keepflow.visualization import Visualizer
 from keepflow.visualization import plot_density
 from keepflow.data.traj.trajectron_dataset import get_hypers
+from keepflow.utils import EmptyEnv
 
 class TrajVisualizer(Visualizer):
     def __init__(self, cfg: CfgNode):
@@ -25,37 +26,43 @@ class TrajVisualizer(Visualizer):
         
         self.dataset = cfg.DATA.DATASET_NAME
         
-        import dill
-        env_path = Path(cfg.DATA.PATH) / cfg.DATA.TASK / "processed_data" / f"{cfg.DATA.DATASET_NAME}_test.pkl"
-        with open(env_path, 'rb') as f:
-            self.env = dill.load(f, encoding='latin1')
+        self.obs_len = cfg.DATA.OBSERVE_LENGTH
+        self.pred_len = cfg.DATA.PREDICT_LENGTH
         
-        # TODO: params for other nodes
-        hypers = get_hypers(cfg)
-        node = 'PEDESTRIAN'
-        self.state = hypers[cfg.DATA.TRAJ.PRED_STATE][node]
-        mean, std = self.env.get_standardize_params(self.state, node)
-        self.mean = mean
-        self.std = std
-        self.std = self.env.attention_radius[('PEDESTRIAN', 'PEDESTRIAN')]
+        # # TODO: params for other nodes
+        # hypers = get_hypers(cfg)
+        # node = 'PEDESTRIAN'
+        # self.state = hypers[cfg.DATA.TRAJ.PRED_STATE][node]
+        # mean, std = self.env.get_standardize_params(self.state, node)
+        # self.mean = mean
+        # self.std = std
+        # self.std = self.env.attention_radius[('PEDESTRIAN', 'PEDESTRIAN')]
         
         #self.num_grid = 500  # for visualization
         self.num_grid = 100
-        if hasattr(self.env, "gt_dist"):
-            self.gt_dist = self.env.gt_dist
-        else:
-            self.gt_dist = None
         
-        self.observe_length = cfg.DATA.OBSERVE_LENGTH
+        if 'sim' in self.dataset:
+            import dill
+            env_path = Path(cfg.DATA.PATH) / cfg.DATA.TASK / "processed_data" / f"{cfg.DATA.DATASET_NAME}_test.pkl"
+            with open(env_path, 'rb') as f:
+                self.env = dill.load(f, encoding='latin1')
+                self.gt_dist = self.env.gt_dist
+                
+        else:
+            self.env = EmptyEnv(cfg)
+            self.gt_dist = None
 
     def __call__(self, dict_list: List[Dict]) -> None:
+        # assume batch size is 1
         index = dict_list[0]['index']
-        min_pos, max_pos = self.get_minmax(index)
+        min_pos, max_pos = self.get_minmax(dict_list[0])
         
         # (batch, timesteps, [x,y])
         obs = self.to_numpy(dict_list[0]['obs'][:, :, 0:2])
         gt = self.to_numpy(dict_list[0]['gt'])
-
+        neighbor = [self.to_numpy(n) for n in dict_list[0]['neighbors']]
+        neighbor_gt = [self.to_numpy(n) for n in dict_list[0]['neighbors_gt']]
+        
         pred = []
         for d in dict_list:
             pred.append(self.to_numpy(d[("pred", 0)][:, :, None]))
@@ -65,18 +72,21 @@ class TrajVisualizer(Visualizer):
         # (batch, timesteps, num_trials, [x,y])
         pred = np.concatenate(pred, axis=2)
         for i in range(len(obs)):
-            self.plot2d_trajectories(obs[i:i+1],
-                                     gt[i:i+1],
-                                     pred[i:i+1],
+            self.plot2d_trajectories(obs[i],
+                                     gt[i],
+                                     pred[i],
+                                     neighbor[i],
+                                     neighbor_gt[i],
                                      index[i],
                                      max_pos,
                                      min_pos)
         
-        if ("prob", 0) in dict_list[0]:
+        # if ("prob", 0) in dict_list[0]:
+        if False:
             path_density_map = self.output_dir / "density_map"
             path_density_map.mkdir(exist_ok=True)
             
-            xx, yy = self.get_grid(index)
+            xx, yy = self.get_grid(min_pos, max_pos)
             
             for k in dict_list[0].keys():
                 if k[0] == "prob":
@@ -88,8 +98,8 @@ class TrajVisualizer(Visualizer):
                     obs = self.to_numpy(dict_list[0]['obs'])[..., :2]
                     gt = self.to_numpy(dict_list[0]['gt'])
                     traj = np.concatenate([obs, gt], axis=1)
-                    obs = traj[:, :self.observe_length + update_step]
-                    gt = traj[:, self.observe_length + update_step-1:]
+                    obs = traj[:, :self.obs_len + update_step]
+                    gt = traj[:, self.obs_len + update_step-1:]
                     
                     zz_list = []
                     for j in range(timesteps):
@@ -107,8 +117,8 @@ class TrajVisualizer(Visualizer):
     def prob_on_grid(self, dict_list: List[Dict]) -> List:
         if ("prob", 0) in dict_list[0]:
             index = dict_list[0]['index']
-            min_pos, max_pos = self.get_minmax(index)
-            xx, yy = self.get_grid(index)
+            min_pos, max_pos = self.get_minmax(dict_list[0])
+            xx, yy = self.get_grid(min_pos, max_pos)
             
             for data_dict in dict_list:
                 data_dict["grid"] = [xx, yy]
@@ -133,6 +143,9 @@ class TrajVisualizer(Visualizer):
                             
                         elif self.model_name == "Trajectron" or self.model_name == "GT_Dist":
                             value = torch.Tensor(np.array([xx.flatten(), yy.flatten()])).transpose(0, 1)[None, :, None].tile(1, 1, prob.mus.shape[2], 1).to(self.device)
+                            if self.model_name == 'GT_Dist':
+                                # GT distributions are on the global coodinates
+                                value += data_dict['curr_state'][:, None, None, 0:2]
                             zz_batch = self.to_numpy(torch.exp(prob.log_prob(value)))
                             data_dict[k] = zz_batch
                             
@@ -156,11 +169,14 @@ class TrajVisualizer(Visualizer):
                             gt_traj_log_prob = torch.log(torch.Tensor(gt_traj_prob)).squeeze()
                             if torch.sum(torch.isnan(gt_traj_log_prob) + torch.isinf(gt_traj_log_prob)) > 0:
                                 mask = torch.isnan(gt_traj_log_prob) + torch.isinf(gt_traj_log_prob)
-                                value = torch.min(gt_traj_log_prob[~mask])
+                                try:
+                                    value = torch.min(gt_traj_log_prob[~mask])
+                                except:
+                                    import pdb;pdb.set_trace()
                                 gt_traj_log_prob = torch.nan_to_num(gt_traj_log_prob, nan=value, neginf=value)
                             data_dict[("gt_traj_log_prob", k[1])] = gt_traj_log_prob[None]
                         
-                if self.gt_dist is not None: #assume simfork
+                if self.gt_dist is not None: #assume simulated dataset, for EMD metric
                     bs, timesteps, d = data_dict["gt"].shape
                     split = True
                     #split = False
@@ -178,19 +194,39 @@ class TrajVisualizer(Visualizer):
                     
         return dict_list
     
-    def get_grid(self, index):
-        min_pos, max_pos = self.get_minmax(index)
+    def get_grid(self, min_pos, max_pos):
         xs = np.linspace(min_pos[0], max_pos[0], num=self.num_grid)
         ys = np.linspace(min_pos[1], max_pos[1], num=self.num_grid)
         xx, yy = np.meshgrid(xs, ys)
         
         return xx, yy
 
-    def get_minmax(self, index):
-        idx = [s.name for s in self.env.scenes].index(index[0][0])
-        max_pos, min_pos = self.env.scenes[idx].calculate_pos_min_max()
-        max_pos += 0.05 * (max_pos - min_pos)
-        min_pos -= 0.05 * (max_pos - min_pos)
+    def get_minmax(self, data_dict):
+        if 'sim' in self.dataset:
+            idx = [s.name for s in self.env.scenes].index(data_dict['index'][0][0])
+            max_pos, min_pos = self.env.scenes[idx].calculate_pos_min_max()
+        else:
+            obs = data_dict['obs'][..., 0:2]
+            gt = data_dict['gt']
+            agent = torch.cat([obs, gt], dim=1)
+            all_traj = agent[:, None]
+            if len(data_dict['neighbors']) != 0:  # if neighbors exist
+                neighbor = data_dict['neighbors'][..., 0:2]
+                neighbor_gt = data_dict['neighbors_gt']
+                neighbor = torch.cat([neighbor, neighbor_gt], dim=2)
+                all_traj = torch.cat([all_traj, neighbor], dim=1)
+            
+            min_pos = torch.amin(all_traj.nan_to_num(all_traj.nanmean()), dim=(0, 1, 2)).cpu().numpy()
+            max_pos = torch.amax(all_traj.nan_to_num(all_traj.nanmean()), dim=(0, 1, 2)).cpu().numpy()
+            
+        if np.max(max_pos - min_pos) > 5.0:
+            max_pos += 0.05 * (max_pos - min_pos)
+            min_pos -= 0.05 * (max_pos - min_pos)
+        else:
+            center = (max_pos + min_pos) / 2
+            max_pos = np.array([2.5, 2.5]) + center
+            min_pos = np.array([-2.5, -2.5]) + center
+        
         return min_pos, max_pos
                     
     def griddata_on_cluster(self, i, prob, xx, yy, max_pos, min_pos, j):
@@ -254,47 +290,64 @@ class TrajVisualizer(Visualizer):
                             obs:  np.ndarray,
                             gt:   np.ndarray,
                             pred: np.ndarray,
+                            neighbor: np.ndarray,
+                            neighbor_gt: np.ndarray,
                             index: Tuple,
                             max_pos: np.ndarray,
                             min_pos: np.ndarray) -> None:
         """plot 2d trajectories
 
         Args:
-            obs (np.ndarray): (N_seqs, N_timesteps, [x, y])
-            gt (np.ndarray): (N_seqs, N_timesteps, [x,y])
-            pred (np.ndarray): (N_seqs, N_timesteps, N_trials, [x,y])
-            img_path (Path): Path
+            obs (np.ndarray): (N_timesteps, [x, y])
+            gt (np.ndarray): (N_timesteps, [x,y])
+            pred (np.ndarray): (N_timesteps, N_trials, [x,y])
+            neighbor: (N_timesteps, N_neighbors, [x,y])  you can pass empty list [] for ignoring
+            neighbor_gt: (N_timesteps, N_neighbors, [x,y])  you can pass empty list [] for ignoring
+            index: [dataset_name, timestamp, agent_id]
+            max_pos: [x,y]
+            min_pos: [x,y]
         """
 
-        N_seqs, N_timesteps, N_trials, N_dim = pred.shape
-        gt_vis = np.zeros([N_seqs, N_timesteps+1, N_dim])
-        gt_vis[:, 0] = obs[:, -1]
-        gt_vis[:, 1:] = gt
-
-        pred_vis = np.zeros([N_seqs, N_timesteps+1, N_trials, N_dim])
-        # (num_seqs, num_dim) -> (num_seqs, 1, num_dim)
-        pred_vis[:, 0] = obs[:, -1][:, None]
-        pred_vis[:, 1:] = pred
-
+        N_timesteps, N_trials, N_dim = pred.shape
+        N_neighbors, _, _ = neighbor.shape
+        
         f, ax = plt.subplots(1, 1)
         ax.set_aspect('equal', adjustable='box')
         ax.set_xlim(min_pos[0], max_pos[0])
         ax.set_ylim(min_pos[1], max_pos[1])
+        
+        gt_vis = np.zeros([N_timesteps+1, N_dim])
+        gt_vis[0] = obs[-1]
+        gt_vis[1:] = gt
 
-        for j in range(N_seqs):
-            sns.lineplot(x=obs[j, :, 0], y=obs[j, :, 1], color='black',
-                         legend='brief', label="obs", marker='o')
-            sns.lineplot(x=gt_vis[j, :, 0], y=gt_vis[j, :, 1],
-                         color='blue', legend='brief', label="GT", marker='o')
-            for i in range(pred.shape[2]):
-                if i == 0:
-                    sns.lineplot(x=pred_vis[j, :, i, 0], y=pred_vis[j, :, i, 1],
-                                 color='green', legend='brief', label="pred", marker='o')
-                else:
-                    sns.lineplot(
-                        x=pred_vis[j, :, i, 0], y=pred_vis[j, :, i, 1], color='green', marker='o')
-                    
-        img_path = self.output_dir / f"{index[0]}_{index[1]}_{index[2].strip('PEDESTRIAN/')}.png"
+        sns.lineplot(x=obs[:, 0], y=obs[:, 1], color='black',
+                        legend='brief', label="obs", marker='o')
+        sns.lineplot(x=gt_vis[:, 0], y=gt_vis[:, 1],
+                        color='blue', legend='brief', label="GT", marker='o')
+        
+        if not len(neighbor) == 0:
+            neighbor_gt_vis = np.zeros([N_neighbors, N_timesteps+1, N_dim])
+            neighbor_gt_vis[:, 0] = neighbor[:, -1]
+            neighbor_gt_vis[:, 1:] = neighbor_gt
+            
+            for j in range(N_neighbors):
+                sns.lineplot(x=neighbor[j, :, 0], y=neighbor[j, :, 1], color='black', marker='o', alpha=0.3)
+                sns.lineplot(x=neighbor_gt_vis[j, :, 0], y=neighbor_gt_vis[j, :, 1], color='blue', marker='o', alpha=0.3)
+        
+        pred_vis = np.zeros([N_timesteps+1, N_trials, N_dim])
+        # (num_seqs, num_dim) -> (num_seqs, 1, num_dim)
+        pred_vis[0] = obs[None, -1]
+        pred_vis[1:] = pred
+        
+        for i in range(N_trials):
+            if i == 0:
+                sns.lineplot(x=pred_vis[:, i, 0], y=pred_vis[:, i, 1],
+                                color='green', legend='brief', label="pred", marker='o')
+            else:
+                sns.lineplot(
+                    x=pred_vis[:, i, 0], y=pred_vis[:, i, 1], color='green', marker='o')
+                
+        img_path = self.output_dir / f"{index[0]}_{index[2].strip('PEDESTRIAN/')}_{index[1]}.png"
         plt.savefig(img_path)
         plt.close()
         
