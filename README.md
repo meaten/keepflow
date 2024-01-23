@@ -2,7 +2,7 @@
 This repository aims to provide the code base for temporal prediction tasks, such as trajectory, motion, and video predictions.
 
 # News
-- Jan 2024 repository public on GitHub :confetti_ball::confetti_ball::confetti_ball:
+- Jan 2024: repository public on GitHub :confetti_ball::confetti_ball::confetti_ball:
 
 # Dependencies
 ```
