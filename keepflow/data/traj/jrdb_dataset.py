@@ -92,7 +92,9 @@ class JRDB_Dataset(Dataset):
             idx, obs, gt, neighbors, neighbors_gt, \
                 agent_type, neighbor_type, curr_state, \
                     dt, first_history_index = map(list, zip(*data))
-            # neighbor_type = np.array(neighbor_type)
+            neighbors = np.array(neighbors, dtype=object)
+            neighbors_gt = np.array(neighbors_gt, dtype=object)
+            neighbor_type = np.array(neighbor_type, dtype=object)
             this_node_type = agent_type
         
             self.idx = idx

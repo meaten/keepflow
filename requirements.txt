@@ -1,16 +1,17 @@
 yacs
 tqdm
-numpy
-pillow
+easydict
+numpy==1.20.3
 scipy
-scikit-image
-#torch
-#torchvision
-kornia
-torchfile
-pyquaternion
-descartes
-shapely==1.7.1
+torch
+optuna
+POT
+pandas<2.0.0
+
+dill
+ncls
+orjson
+joblib
 
 matplotlib
 seaborn

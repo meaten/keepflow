@@ -13,3 +13,6 @@
 [submodule "extern/traj/JRDB-Traj"]
 	path = extern/traj/jrdb_traj
 	url = https://github.com/vita-epfl/JRDB-Traj.git
+[submodule "extern/traj/trajdata"]
+	path = extern/traj/trajdata
+	url = https://github.com/meaten/trajdata.git
