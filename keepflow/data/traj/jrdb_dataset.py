@@ -62,7 +62,11 @@ class JRDB_Dataset(Dataset):
         
         path_npz = Path(cfg.DATA.PATH) / cfg.DATA.TASK / 'jrdb_cache'
         path_npz.mkdir(exist_ok=True)
-        path_npz /= ('_'.join([cfg.DATA.DATASET_NAME, split]) + '.npz')
+        if split == 'train':
+            path_npz /= ('_'.join([cfg.DATA.DATASET_NAME, split, 'nan', str(cfg.DATA.TRAJ.ACCEPT_NAN)]) + '.npz')
+        else:
+            path_npz /= ('_'.join([cfg.DATA.DATASET_NAME, split]) + '.npz')
+
         
         if path_npz.exists():
             print(f'found serialized jrdb dataset at {path_npz}. loading...')
@@ -86,8 +90,8 @@ class JRDB_Dataset(Dataset):
             split = split + '/'
             dt = 0.5
             scenes, _, _ = prepare_data(path, subset=split, goals=False)
-            # data = [paths_to_item(scene, dt) for scene in tqdm(scenes)]
-            data = Parallel(n_jobs=4)(delayed(paths_to_item)(scene, dt) for scene in tqdm(scenes))
+            data = [paths_to_item(scene, dt, cfg.DATA.TRAJ.ACCEPT_NAN) for scene in tqdm(scenes)]
+            # data = Parallel(n_jobs=4)(delayed(paths_to_item)(scene, dt, cfg.DATA.TRAJ.ACCEPT_NAN) for scene in tqdm(scenes))
             data = [d for d in data if not len(d) == 0]
             idx, obs, gt, neighbors, neighbors_gt, \
                 agent_type, neighbor_type, curr_state, \
@@ -146,11 +150,11 @@ class JRDB_Dataset(Dataset):
             self.first_history_index[idx], self.this_node_type[idx])
      
      
-def paths_to_item(scene, dt):
+def paths_to_item(scene, dt, accept_nan):
     filename, scene_id, paths = scene
     ped_id = str(paths[0][0].pedestrian)
     paths = Reader.paths_to_xy(paths)
-    paths = filter_path(paths)
+    paths = filter_path(paths, accept_nan)
     if len(paths) == 0:
         return []
     pos, vel, acc, nan_flag = calc_pos_vel_acc(paths, dt)
@@ -184,10 +188,19 @@ def fetch(state, pva):
     else:
         raise ValueError
      
-def filter_path(paths):
+def filter_path(paths, accept_nan):
     # assume obs length = 8
-    if paths[9-2,0,-1]==0 or paths[9-1,0,-1]==0:
-        return []
+    if accept_nan:
+        if paths[9-2,0,-1]==0 or paths[9-1,0,-1]==0:
+            return []
+    else:
+        if np.any(paths[:9, 0, -1] == 0):
+            return []
+        else:
+            # exclude the paths with nan observations
+            idx_nan = np.sum(paths[:9, :, -1] == 0, axis=0) > 0
+            idx_non_nan = ~idx_nan
+            paths = paths[:, idx_non_nan]            
     paths = keep_valid_neigh(paths)
     paths, _ = drop_distant_far(paths, r=3.0)
     return paths

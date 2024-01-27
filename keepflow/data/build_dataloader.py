@@ -102,10 +102,13 @@ def build_traj_dataloader(cfg: CfgNode, split: str) -> Tuple[Dataset, Callable] 
         )
         cache_path = Path(cfg.DATA.PATH) / cfg.DATA.TASK / 'cache'
         cache_path.mkdir(exist_ok=True)
-        cache_path = cache_path / desired_split 
-        dataset.load_or_create_cache(
-            str(cache_path), num_workers=cfg.DATA.NUM_WORKERS, filter_fn=None
-        )
+        if split == 'train':
+            cache_path = cache_path / f'{desired_split}_nan_{str(cfg.DATA.TRAJ.ACCEPT_NAN)}'
+        else:
+            cache_path = cache_path / desired_split
+        # dataset.load_or_create_cache(
+        #     str(cache_path), num_workers=cfg.DATA.NUM_WORKERS, filter_fn=None
+        # )
 
         from .traj.collate_wrapper import CollateWrapper
         if cfg.DATA.DATASET_NAME == 'eth' and split == 'test':

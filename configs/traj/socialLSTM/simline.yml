@@ -4,8 +4,8 @@ MODEL:
 DATA:
   DATASET_NAME: "simline"
   TRAJ:
-    STATE: state_p
-    PRED_STATE: state_p
+    STATE: state_pva
+    PRED_STATE: state_v
 SOLVER:
   USE_SCHEDULER: True
   ITER: 50

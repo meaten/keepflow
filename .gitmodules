@@ -16,3 +16,6 @@
 [submodule "extern/traj/trajdata"]
 	path = extern/traj/trajdata
 	url = https://github.com/meaten/trajdata.git
+[submodule "extern/traj/sgan"]
+	path = extern/traj/sgan
+	url = https://github.com/agrimgupta92/sgan.git
