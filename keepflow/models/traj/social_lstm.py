@@ -37,7 +37,7 @@ class socialLSTM(ModelTemplate):
             pool_every_timestep=False,
             dropout=0.0,
             bottleneck_dim=32,
-            neighborhood_size=2.0,
+            neighborhood_size=3.0,
             grid_size=8,
             batch_norm=False,
             device=cfg.DEVICE
@@ -224,7 +224,6 @@ class CustomSocialPooling(SocialPooling):
             grid_pos += offset
             grid_pos[within_bound != 0] = 0
             grid_pos = grid_pos.view(-1, 1).expand_as(curr_hidden_repeat)
-            
             curr_pool_h = curr_pool_h.scatter_add(0, grid_pos.to(self.device),
                                                   curr_hidden_repeat)
             curr_pool_h = curr_pool_h[1:]

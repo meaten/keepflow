@@ -65,7 +65,7 @@ def visualize(cfg, model: torch.nn.Module):
         result_list = []
         print("timing the computation, evaluating probability map, and visualizing... ")
         data_loader = build_dataloader(cfg, rand=False, split = "test", batch_size=1)
-        n_vis = 10
+        n_vis = 100
         prev_idx = None
         count = 0
         for data_dict in data_loader:

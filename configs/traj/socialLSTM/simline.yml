@@ -8,5 +8,4 @@ DATA:
     PRED_STATE: state_v
 SOLVER:
   USE_SCHEDULER: True
-  ITER: 50
   SAVE_EVERY: 10

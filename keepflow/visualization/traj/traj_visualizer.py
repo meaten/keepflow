@@ -67,7 +67,8 @@ class TrajVisualizer(Visualizer):
         for d in dict_list:
             pred.append(self.to_numpy(d[("pred", 0)][:, :, None]))
             assert np.all(obs == self.to_numpy(d["obs"][:, :, 0:2]))
-            assert np.all(gt == self.to_numpy(d["gt"]))
+            idx_gt_non_nan = ~np.isnan(gt)
+            assert np.all(gt[idx_gt_non_nan] == self.to_numpy(d["gt"])[idx_gt_non_nan])
         
         # (batch, timesteps, num_trials, [x,y])
         pred = np.concatenate(pred, axis=2)
@@ -321,9 +322,9 @@ class TrajVisualizer(Visualizer):
         gt_vis[1:] = gt
 
         sns.lineplot(x=obs[:, 0], y=obs[:, 1], color='black',
-                        legend='brief', label="obs", marker='o')
+                        legend='brief', label="obs", marker='o', sort=False)
         sns.lineplot(x=gt_vis[:, 0], y=gt_vis[:, 1],
-                        color='blue', legend='brief', label="GT", marker='o')
+                        color='blue', legend='brief', label="GT", marker='o', sort=False)
         
         if not len(neighbor) == 0:
             neighbor_gt_vis = np.zeros([N_neighbors, N_timesteps+1, N_dim])
@@ -331,8 +332,8 @@ class TrajVisualizer(Visualizer):
             neighbor_gt_vis[:, 1:] = neighbor_gt
             
             for j in range(N_neighbors):
-                sns.lineplot(x=neighbor[j, :, 0], y=neighbor[j, :, 1], color='black', marker='o', alpha=0.3)
-                sns.lineplot(x=neighbor_gt_vis[j, :, 0], y=neighbor_gt_vis[j, :, 1], color='blue', marker='o', alpha=0.3)
+                sns.lineplot(x=neighbor[j, :, 0], y=neighbor[j, :, 1], color='black', marker='o', alpha=0.3, sort=False)
+                sns.lineplot(x=neighbor_gt_vis[j, :, 0], y=neighbor_gt_vis[j, :, 1], color='blue', marker='o', alpha=0.3, sort=False)
         
         pred_vis = np.zeros([N_timesteps+1, N_trials, N_dim])
         # (num_seqs, num_dim) -> (num_seqs, 1, num_dim)
@@ -342,10 +343,10 @@ class TrajVisualizer(Visualizer):
         for i in range(N_trials):
             if i == 0:
                 sns.lineplot(x=pred_vis[:, i, 0], y=pred_vis[:, i, 1],
-                                color='green', legend='brief', label="pred", marker='o')
+                                color='green', legend='brief', label="pred", marker='o', sort=False)
             else:
                 sns.lineplot(
-                    x=pred_vis[:, i, 0], y=pred_vis[:, i, 1], color='green', marker='o')
+                    x=pred_vis[:, i, 0], y=pred_vis[:, i, 1], color='green', marker='o', sort=False)
                 
         img_path = self.output_dir / f"{index[0]}_{index[2].strip('PEDESTRIAN/')}_{index[1]}.png"
         plt.savefig(img_path)
