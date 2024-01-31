@@ -1,5 +1,5 @@
 # keepflow
-This repository aims to provide the code base for temporal prediction tasks, such as trajectory, motion, and video predictions.
+This repository aims to provide the code base for temporal several prediction tasks, such as trajectory :curly_loop:, motion :dancer:, and video :movie_camera:.
 
 ## News
 - Jan 2024: repository public on GitHub :confetti_ball::confetti_ball::confetti_ball:
@@ -34,14 +34,6 @@ cfg.DATA.PATH/traj/raw/all_data
 
 Please follow the [jrdb-traj instruction](https://github.com/vita-epfl/JRDB-Traj) and execute `dataload.sh` and `preprocess.sh` in extern/traj/jrdb-traj/.
 
-
-### Video prediction
-
-TBA
-
-### Motion prediction
-
-TBA
 
 ## Supported Models
 ### Trajectory prediction
