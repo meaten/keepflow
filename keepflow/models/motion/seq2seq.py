@@ -82,7 +82,7 @@ class Seq2SeqModel(ModelTemplate):
         data_dict[("pred", 0)] = outputs
         return data_dict
 
-    def update(self, data_dict: Dict) -> Dict:
+    def training_step(self, data_dict: Dict) -> Dict:
         self.optimizer.zero_grad()
         data_dict = self.predict(data_dict)
         loss = torch.mean(torch.sum(torch.abs(data_dict["gt"] - data_dict["pred"]), dim=2))

@@ -6,25 +6,35 @@ from pathlib import Path
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="pytorch training code for task-agnostic time-series prediction")
-    parser.add_argument("--config_dir", type=str, default='',
+    parser.add_argument("--config_dir", type=str,
                         metavar="DIR", help='path to the directory of config files')
     parser.add_argument("--device", type=str, default='cuda:0')
     parser.add_argument("--n_parallel", type=int, default=1)
     parser.add_argument("--test_only", action='store_true')
+    parser.add_argument("--visualize", action='store_true')
     return parser.parse_args()
 
 
 def run_parallel(args: argparse.Namespace) -> None:
-    if args.test_only:
-        base_cmds = [["python3", "test.py"]]
+    train_cmd = ["python3", "train.py", ]
+    if args.visualize:
+        test_cmd = ["python3", "test.py", "--visualize"]
     else:
-        base_cmds = [["python3", "train.py", ], ["python3", "test.py"]]
+        test_cmd = ["python3", "test.py"]
+
+    if args.test_only:
+        base_cmds = [test_cmd]
+    else:
+        base_cmds = [train_cmd, test_cmd]
     
 
     config_files = Path(args.config_dir).rglob("*.yml")
     
     cmds = []
     for base, c in itertools.product(base_cmds, config_files):
+        if 'sim' in str(c):
+            continue
+            
         cmd = base + [
                     "--device",
                     args.device,

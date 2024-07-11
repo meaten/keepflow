@@ -1,0 +1,14 @@
+MODEL:
+  TYPE: ContinuousFlowChain_CIF_separate_cond
+
+DATA:
+  DATASET_NAME: "simunicycle"
+  TRAJ:
+    PRED_STATE: 'state_v'
+    
+
+
+SOLVER:
+  USE_SCHEDULER: True
+  LR: 1e-6
+  

@@ -1,0 +1,15 @@
+MODEL:
+  TYPE: ContinuousFlowChainOnestep_CIF
+
+DATA:
+  DATASET_NAME: "simfork"
+  BATCH_SIZE: 128
+  TRAJ:
+    PRED_STATE: 'state_p'
+    
+    
+SOLVER:
+  USE_SCHEDULER: True
+  LR: 1e-5
+  
+  

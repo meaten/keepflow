@@ -1,4 +1,3 @@
-import sys
 from yacs.config import CfgNode
 from pathlib import Path
 from typing import Dict
@@ -15,6 +14,12 @@ from trajdata.data_structures import AgentType
 from keepflow.models import ModelTemplate
 from keepflow.utils import EmptyEnv
 
+from .mid import (
+    get_traj_hypers,
+    ModelRegistrar,
+    Trajectron
+)
+
 from .arflow import (
     FlowSequential,
     LinearMaskedCoupling,
@@ -22,15 +27,20 @@ from .arflow import (
     MADE
 )
 
-from .mid import (
-    get_traj_hypers,
-    ModelRegistrar,
-    Trajectron
-)
 
 class FlowChainTraj(ModelTemplate):
     def __init__(self, cfg: CfgNode) -> None:
         super().__init__(cfg)
+        
+        self._build_encoder(cfg)
+        self._build_flow(cfg)
+        self._build_optimizer(cfg)
+        
+        self.ldjs_tmp = None
+        self.base_prob_normalizer_tmp = None
+        
+    def _build_encoder(self, cfg: CfgNode) -> None:
+        ### Trajectron Encoder
         self.pred_state = cfg.DATA.TRAJ.PRED_STATE
         
         with open("extern/traj/MID/configs/baseline.yaml") as f:
@@ -51,42 +61,52 @@ class FlowChainTraj(ModelTemplate):
         self.encoder.set_environment(env)
         self.encoder.set_annealing_params()
 
+    def _build_model_dict(self, cfg: CfgNode) -> Dict:
         model_dict = {
             "FlowChain": FlowChain,
             "FlowChain_separate": FlowChain_separate,
             "FlowChain_separate_cond": FlowChain_separate_cond,
-            "FlowChain_VFlow": FlowChain_VFlow,
-            "FlowChain_VFlow_separate": FlowChain_VFlow_separate,
-            "FlowChain_VFlow_separate_cond": FlowChain_VFlow_separate_cond,
             "FlowChain_CIF": FlowChain_CIF,
             "FlowChain_CIF_separate": FlowChain_CIF_separate,
             "FlowChain_CIF_separate_cond": FlowChain_CIF_separate_cond
         }
+        
+        return model_dict
 
+    def _build_flow(self, cfg: CfgNode):
+        ### FlowChain Model
+        model_dict = self._build_model_dict(cfg)
+        
         n_blocks = cfg.MODEL.FLOW.N_BLOCKS
         n_hidden = cfg.MODEL.FLOW.N_HIDDEN
         hidden_size = cfg.MODEL.FLOW.HIDDEN_SIZE
-        conditioning_length = \
+
+        dim_encoder = \
             self.hyperparams["enc_rnn_dim_history"] + \
             self.hyperparams["enc_rnn_dim_edge"] * self.hyperparams["edge_encoding"] + \
             self.hyperparams["enc_rnn_dim_future"] * self.hyperparams["incl_robot_node"]
-
+            
+        self.cond_shaper = nn.Linear(dim_encoder, cfg.MODEL.FLOW.COND_SIZE)
+        
         self.flow = nn.ModuleDict()
-        for node_type in env.NodeType:
+        for node_type in self.env.NodeType:
             output_size = 2
             self.flow[node_type] = model_dict[cfg.MODEL.TYPE](
                 input_size=output_size,
                 n_blocks=n_blocks,
                 n_hidden=n_hidden,
                 hidden_size=hidden_size,
-                cond_label_size=conditioning_length,
+                cond_size=cfg.MODEL.FLOW.COND_SIZE,
                 flow_architecture=cfg.MODEL.FLOW.ARCHITECTURE,
-                pred_len=self.pred_len
+                pred_len=self.pred_len,
+                base_sigma=cfg.MODEL.FLOW.BASE_SIGMA,
             )
-
+    
+    def _build_optimizer(self, cfg: CfgNode) -> None:
         self.dequantize = cfg.SOLVER.DEQUANTIZE
 
         decay_parameters = [
+            # n for n, p in self.flow.named_parameters() if 'bias' not in n]
             n for n, p in self.named_parameters() if 'bias' not in n]
         
         optimizer_grouped_parameters = [
@@ -100,14 +120,11 @@ class FlowChainTraj(ModelTemplate):
             },
         ]
         
-        self.optimizer = optim.Adam(
+        self.optimizer = optim.AdamW(
             optimizer_grouped_parameters, cfg.SOLVER.LR)
         self.optimizers = [self.optimizer]
 
-        self.ldjs_tmp = None
-        self.base_prob_normalizer_tmp = None
-        
-    def create_batch(self, data_dict):
+    def _create_batch(self, data_dict):
         agent_type = data_dict['agent_type']
         neighbor_type = data_dict['neighbor_type']
         
@@ -116,6 +133,7 @@ class FlowChainTraj(ModelTemplate):
         
         for i in range(len(agent_type)):
             for edge_type in neighbors.keys():
+                
                 if AgentType[edge_type[0]].value == agent_type[i]:
                     idx = torch.where(neighbor_type[i] == AgentType[edge_type[1]].value)
                 else:
@@ -136,30 +154,33 @@ class FlowChainTraj(ModelTemplate):
         
         return batch
     
-    def encode(self, data_dict: Dict, node_type):
-        batch = self.create_batch(data_dict)
+    def get_node_type(self, data_dict: Dict) -> AgentType:
+        # assume all agnet types are the same in this minibatch
+        return str(AgentType(data_dict['agent_type'][0].item())).lstrip('AgentType.')
+    
+    def _encode(self, data_dict: Dict, node_type):
+        batch = self._create_batch(data_dict)
         encoded_x = self.encoder.get_latent(batch, node_type)
-        encoded_x = encoded_x[:, None].expand(-1, self.pred_len, -1)
-        return encoded_x
+        cond = self.cond_shaper(encoded_x)
+        return cond
     
     def predict(self, data_dict: Dict, return_prob: bool = True) -> Dict:
         if return_prob:
-            return self.predict_inverse_prob(data_dict)
+            return self._predict_inverse_prob(data_dict)
         else:
-            return self.predict_inverse_ML(data_dict)
+            return self._predict_inverse(data_dict)
         # return self.predict_forward(data_dict)
 
-    def predict_inverse_prob(self, data_dict: Dict) -> Dict:
-        node = str(AgentType(data_dict['agent_type'][0].item())).lstrip('AgentType.')  # assume all agnet types are the same in this minibatch
-        dist_args = self.encode(data_dict, node)
+    def _predict_inverse_prob(self, data_dict: Dict) -> Dict:
+        node = self.get_node_type(data_dict)
+        cond = self._encode(data_dict, node)
     
         sample_num = 10000
-
-        base_pos = self.get_base_pos(
-            data_dict)[:, None].expand(-1, sample_num, -1).clone()
-        dist_args = dist_args[:, None].expand(-1, sample_num, -1, -1)
+        
+        base_pos = self._get_base_pos(data_dict)
         sampled_seq, log_prob, seq_ldjs, base_log_prob = self.flow[node].sample_with_log_prob(
-            base_pos, cond=dist_args)
+            base_pos[:, None].expand(-1, sample_num, -1),
+            cond=cond[:, None].expand(-1, sample_num, -1))
         
         # for update
         self.ldjs_tmp = seq_ldjs
@@ -167,36 +188,22 @@ class FlowChainTraj(ModelTemplate):
 
         data_dict[("prob", 0)] = torch.cat(
             [sampled_seq, log_prob[..., None]], dim=-1)
-        """
-        log_prob = torch.nan_to_num(log_prob, nan=-float('inf'))
-        index_ML = log_prob[..., -1].argmax(dim=1)[:, None, None]
-        index_ML = index_ML.expand(data_dict["gt"].size()).unsqueeze(1)
-        data_dict[("pred", 0)] = torch.gather(sampled_seq, 1, index_ML).squeeze(1)  # sample maximum likelihood
-        """
+
         data_dict[("pred", 0)] = sampled_seq[:, -1]
-        if False:
-            data_dict[("gt_traj_log_prob", 0)] = self.flow.log_prob_sequential(base_pos[:, 0], data_dict["gt"], dist_args[:, 0])
+            
         return data_dict
 
-    def predict_inverse_ML(self, data_dict: Dict) -> Dict:
-        node = str(AgentType(data_dict['agent_type'][0].item())).lstrip('AgentType.')  # assume all agnet types are the same in this minibatch
-        dist_args = self.encode(data_dict, node)
+    def _predict_inverse(self, data_dict: Dict) -> Dict:
+        node = self.get_node_type(data_dict)
+        cond = self._encode(data_dict, node)
         
-        sample_num = 100
+        sample_num = 1
 
-        base_pos = self.get_base_pos(
-            data_dict)[:, None].expand(-1, sample_num, -1).clone()
-        dist_args = dist_args[:, None].expand(-1, sample_num, -1, -1)
+        base_pos = self._get_base_pos(data_dict)
         sampled_seq, log_prob, seq_ldjs, base_log_prob = self.flow[node].sample_with_log_prob(
-            base_pos, cond=dist_args)
+            base_pos[:, None].expand(-1, sample_num, -1),
+            cond=cond[:, None].expand(-1, sample_num, -1))
         
-        """
-        log_prob = torch.nan_to_num(log_prob, nan=-float('inf'))
-        index_ML = log_prob[..., -1].argmax(dim=1)[:, None, None]
-        index_ML = index_ML.expand(data_dict["gt"].size()).unsqueeze(1)
-        data_dict[("pred", 0)] = torch.gather(sampled_seq, 1,
-                                                 index_ML).squeeze(1)  # sample maximum likelihood
-        """
         data_dict[("pred", 0)] = sampled_seq[:, -1]
         if torch.sum(torch.isnan(data_dict[('pred', 0)])):
             data_dict[("pred", 0)] = torch.where(torch.isnan(data_dict[("pred", 0)]),
@@ -204,8 +211,8 @@ class FlowChainTraj(ModelTemplate):
                                                     data_dict[('pred', 0)])
         return data_dict
 
-    def predict_from_new_obs(self, data_dict: Dict, time_step: int) -> Dict:
-        node = str(AgentType(data_dict['agent_type'][0].item())).lstrip('AgentType.')  # assume all agnet types are the same in this minibatch
+    def update_from_new_obs(self, data_dict: Dict, time_step: int) -> Dict:
+        node = self.get_node_type(data_dict)
         assert 0 < time_step and time_step < self.pred_len, f"time_step for update need to be 0~{self.pred_len-1}, got {time_step}"
         assert ("prob", 0) in data_dict.keys(), "Initial prediction needed before updating"
         
@@ -226,49 +233,21 @@ class FlowChainTraj(ModelTemplate):
             data_dict["gt"][:, time_step:].size()).unsqueeze(1)
         data_dict[("pred", time_step)] = torch.gather(data_dict[(
             "prob", time_step)][..., :2], 1, index_ML).squeeze(1)  # sample maximum likelihood
-        if False:
-            dist_args = self.encoder(data_dict)
-            data_dict[("gt_traj_log_prob", time_step)] = self.flow.log_prob_sequential(data_dict["gt"][:, time_step-1],
-                                                                                       data_dict["gt"],
-                                                                                       dist_args,
-                                                                                       n_step=self.pred_len-time_step-1)
+
         return data_dict
     
-    """
-    def predict_forward(self, data_dict: Dict) -> Dict:
-        node = str(AgentType(data_dict['agent_type'][0].item())).lstrip('AgentType.')  # assume all agnet types are the same in this minibatch
-        # not for *_cond models
-        data_dict = self.predict_inverse(data_dict)  # for data_dict["pred"]
-        dist_args = self.encode(data_dict, node)
-
-        sample_num_per_dim = 200
-        batch_size = data_dict["obs"][-1].size()[0]
-        base_pos = self.get_base_pos(data_dict)[
-            :, None].expand(-1, sample_num_per_dim ** self.output_size, -1).clone()
-        dist_args = dist_args[:, None].expand(
-            -1, sample_num_per_dim ** self.output_size, -1, -1)
-        seq = torch.cartesian_prod(torch.linspace(-3, 3, steps=sample_num_per_dim),
-                                   torch.linspace(-3, 3, steps=sample_num_per_dim))[None, :, None].expand(self.pred_len, -1, batch_size, -1).to(self.device)
-
-        log_prob = self.flow.log_prob_sequential(base_pos, seq, cond=dist_args)
-
-        data_dict[("prob", 0)] = torch.cat(
-            [seq, log_prob[..., None]], dim=-1)
-        return data_dict
-    """
-    
-    def update(self, data_dict: Dict) -> Dict:
-        node = str(AgentType(data_dict['agent_type'][0].item())).lstrip('AgentType.')  # assume all agnet types are the same in this minibatch
-        dist_args = self.encode(data_dict, node)
+    def training_step(self, data_dict: Dict) -> Dict:
+        node = self.get_node_type(data_dict)
+        cond = self._encode(data_dict, node)
         
         gt = data_dict['gt']
         if self.dequantize:
             gt += torch.rand_like(data_dict['gt']) / 100
 
-        base_pos = self.get_base_pos(data_dict)
+        base_pos = self._get_base_pos(data_dict)
         
         mask = ~torch.isnan(gt)[..., 0]
-        loss = -self.flow[node].log_prob(base_pos, gt.nan_to_num(), dist_args)
+        loss = -self.flow[node].log_prob(base_pos, gt.nan_to_num(), cond)
         loss *= mask
         loss = loss.mean()
         
@@ -279,7 +258,7 @@ class FlowChainTraj(ModelTemplate):
         
         return {'loss': loss.mean().item()}
 
-    def get_base_pos(self, data_dict: Dict) -> torch.Tensor:
+    def _get_base_pos(self, data_dict: Dict) -> torch.Tensor:
         # assume x_st contains {'position', 'velocity', 'acceleration'} info
         if self.pred_state == 'state_p':
             return data_dict["obs"][:, -1, :2]
@@ -295,6 +274,7 @@ class FlowChainTraj(ModelTemplate):
         ckpt = {
             'epoch': epoch,
             'encoder': self.registrar.model_dict,
+            'cond_shaper': self.cond_shaper.state_dict(),
             'flow': self.flow.state_dict(),
             'optim_state': self.optimizer.state_dict()
         }
@@ -314,6 +294,7 @@ class FlowChainTraj(ModelTemplate):
         self.encoder.set_environment(self.env)
         self.encoder.set_annealing_params()
         
+        self.cond_shaper.load_state_dict(ckpt['cond_shaper'])
         self.flow.load_state_dict(ckpt['flow'])
         
         self.optimizer.load_state_dict(ckpt['optim_state'])
@@ -328,61 +309,46 @@ class FlowChain(nn.Module):
                  n_blocks: int,
                  hidden_size: int,
                  n_hidden: int,
-                 cond_label_size: int,
+                 cond_size: int,
                  **kwargs):
         super().__init__()
-
+        
+        self.input_size = input_size
+        self.pred_len = kwargs['pred_len']
+        self.base_sigma = kwargs['base_sigma']
+        self.logvar = nn.Parameter((torch.ones(self.pred_len, input_size) * self.base_sigma).log(),
+                                requires_grad=True)
+        
         self.flow_dict = {
             'realNVP': create_RealNVP_step,
             'MAF': create_MAF_step,
         }
-
+        
         self.build_net(n_blocks, input_size, hidden_size,
-                       n_hidden, cond_label_size, **kwargs)
-        pred_len = kwargs['pred_len']
-        self.var = nn.Parameter(torch.ones(
-            pred_len, self.input_size)/10, requires_grad=True)
+                       n_hidden, cond_size, **kwargs)
 
     def base_dist(self, base_pos, step=0):
-        return Normal(base_pos, torch.clamp(self.var[step], min=1e-4))
+        return Normal(base_pos, self.logvar[step].exp())
 
-    def build_net(self, n_blocks, input_size, hidden_size, n_hidden, cond_label_size, **kwargs):
-        self.input_size = input_size
+    def build_net(self, n_blocks, input_size, hidden_size, n_hidden, cond_size, **kwargs):
         flow_key = kwargs['flow_architecture']
         self.net = self.flow_dict[flow_key](n_blocks=n_blocks,
-                                            input_size=self.input_size,
+                                            input_size=input_size,
                                             hidden_size=hidden_size,
                                             n_hidden=n_hidden,
-                                            cond_label_size=cond_label_size)
-
-    # maybe need debugging
-    def forward_sequential(self, seq, cond):
-        x = seq[:, -1:].detach().clone()
-        seq_log_det_jacobians_cumsum = 0
-        for step in range(seq.shape[1]-1, -1, -1):
-            x, log_det_jacobian = self.net(x, cond[:, step:])
-            seq_log_det_jacobians_cumsum += log_det_jacobian
-            if not step == 0:
-                x = torch.cat([seq[:, step-1][:, None], x], dim=1)
-                seq_log_det_jacobians_cumsum = torch.cat([torch.zeros(seq_log_det_jacobians_cumsum.shape[[0,2]])[:, None],
-                                                   seq_log_det_jacobians_cumsum], dim=0)
-        seq_u = x
-        seq_log_det_jacobians_cumsum /= torch.cumsum(torch.ones_like(seq_log_det_jacobians_cumsum), dim=1)
-        return seq_u, seq_log_det_jacobians_cumsum
-    
+                                            cond_size=cond_size)
 
     def forward_separate(self, seq, cond):
-        seq_log_det_jacobians = 0
-        seq_u, log_det_jacobian = self.net(seq, cond)
-        seq_log_det_jacobians += log_det_jacobian
-        return seq_u, seq_log_det_jacobians
+        seq_prev, log_det_jacobian = self.net(seq, cond[:, None].expand(-1, seq.shape[1], -1))
+        seq_log_det_jacobians = log_det_jacobian
+        return seq_prev, seq_log_det_jacobians
 
-    def inverse(self, u, cond):
+    def inverse(self, pos, cond):
         seq = []
         seq_log_det_jacobians = []
-        for step in range(cond.shape[2]):
-            u, log_det_jacobian = self.net.inverse(u, cond[:, :, step])
-            seq.append(u)
+        for step in range(self.pred_len):
+            pos, log_det_jacobian = self.net.inverse(pos, cond)
+            seq.append(pos)
             seq_log_det_jacobians.append(log_det_jacobian)
         seq = torch.stack(seq, dim=2)
         seq_log_det_jacobians = torch.stack(seq_log_det_jacobians, dim=2)
@@ -391,81 +357,64 @@ class FlowChain(nn.Module):
         seq_log_det_jacobians_cumsum /= torch.cumsum(torch.ones_like(seq_log_det_jacobians_cumsum), dim=2)
         return seq, seq_log_det_jacobians_cumsum, seq_log_det_jacobians
 
-    def log_prob(self, base_pos, x, cond):
-        return self.log_prob_separate(base_pos, x, cond)
-        #return self.log_prob_sequential(base_pos, x, cond)
+    def log_prob(self, base_pos, seq, cond):
+        return self.log_prob_separate(base_pos, seq, cond)
 
-    def log_prob_sequential(self, base_pos, x, cond, n_step=None):
-        u, seq_ldjs_cumsum = self.forward_sequential(x, cond, n_step)
-        base_pos = base_pos[:, None]
-        base_log_prob = torch.sum(self.base_dist(base_pos).log_prob(u), dim=-1)
-        return base_log_prob + seq_ldjs_cumsum
-
-    def log_prob_separate(self, base_pos, x, cond):
-        u, seq_ldjs = self.forward_separate(x, cond)
-        base_pos = torch.cat([base_pos[:, None], x[:, :-1]], dim=1)
-        base_log_prob = torch.sum(self.base_dist(
-            base_pos, step=list(range(base_pos.shape[1]))).log_prob(u), dim=-1)
-        return base_log_prob + seq_ldjs
+    def log_prob_separate(self, base_pos, seq, cond):
+        seq_prev, seq_ldjs = self.forward_separate(seq, cond)
+        base_pos = torch.cat([base_pos[:, None], seq[:, :-1]], dim=1)
+        base_log_prob = self.base_dist(base_pos, step=list(range(base_pos.shape[1]))).log_prob(seq_prev)
+        return base_log_prob.sum(dim=-1) + seq_ldjs
 
     def sample(self, base_pos, cond):
-        u = self.base_dist(base_pos).sample()
-        sample, _ = self.inverse(u, cond)
+        base_pos_sample = self.base_dist(base_pos).sample()
+        sample, _, _ = self.inverse(base_pos_sample, cond)
         return sample
 
     def sample_with_log_prob(self, base_pos, cond):
-        u = self.base_dist(base_pos).sample()
-        sample, seq_ldjs_cumsum, seq_ldjs = self.inverse(u, cond)
-        base_log_prob = torch.sum(self.base_dist(
-            base_pos).log_prob(u), dim=-1)[..., None]
+        base_pos_sample = self.base_dist(base_pos).sample()
+        # grid_x, grid_y = torch.meshgrid(
+        #     torch.linspace(-1, 1, 100),
+        #     torch.linspace(-1, 1, 100))
+        # grid_x = grid_x.to(self.logvar.device) * self.logvar[0].exp()[0] * 3
+        # grid_y = grid_y.to(self.logvar.device) * self.logvar[0].exp()[1] * 3
+        # grid = torch.stack([grid_x, grid_y], dim=-1).reshape(-1, 2)
+        # base_pos_sample = base_pos + grid[None]
+        
+        sample, seq_ldjs_cumsum, seq_ldjs = self.inverse(base_pos_sample, cond)
+        base_log_prob = self.base_dist(base_pos).log_prob(base_pos_sample)
+        base_log_prob = base_log_prob.sum(dim=-1)[..., None]
         return sample, base_log_prob + seq_ldjs_cumsum, seq_ldjs, base_log_prob
+        # return sample, base_log_prob.tile([1, 1, 12]), seq_ldjs, base_log_prob
 
 
 class FlowChain_separate(FlowChain):
-    def build_net(self, n_blocks, input_size, hidden_size, n_hidden, cond_label_size, **kwargs):
-        self.input_size = input_size
+    def build_net(self, n_blocks, input_size, hidden_size, n_hidden, cond_size, **kwargs):
         flow_key = kwargs['flow_architecture']
-        pred_len = kwargs['pred_len']
         self.net = nn.ModuleList([self.flow_dict[flow_key](n_blocks=n_blocks,
-                                                           input_size=self.input_size,
+                                                           input_size=input_size,
                                                            hidden_size=hidden_size,
                                                            n_hidden=n_hidden,
-                                                           cond_label_size=cond_label_size)
-                                  for _ in range(pred_len)])
-
-    # maybe need debugging
-    def forward_sequential(self, seq, cond):
-        x = seq[:, -1:].detach().clone()
-        seq_log_det_jacobians_cumsum = 0
-        for step in range(seq.shape[1]-1, -1, -1):
-            x, log_det_jacobian = self.net[step](x, cond[:, step:])
-            seq_log_det_jacobians_cumsum += log_det_jacobian
-            if not step == 0:
-                x = torch.cat([seq[:, step-1][:, None], x], dim=1)
-                seq_log_det_jacobians_cumsum = torch.cat([torch.zeros(seq_log_det_jacobians_cumsum.shape[[0,2]])[:, None],
-                                                   seq_log_det_jacobians_cumsum], dim=0)
-        seq_u = x
-        seq_log_det_jacobians_cumsum /= torch.cumsum(torch.ones_like(seq_log_det_jacobians_cumsum), dim=1)
-        return seq_u, seq_log_det_jacobians_cumsum
-    
+                                                           cond_size=cond_size)
+                                  for _ in range(self.pred_len)])
 
     def forward_separate(self, seq, cond):
-        seq_u = []
+        seq_prev = []
         seq_log_det_jacobians = []
-        for step in range(seq.shape[1]):
-            u, log_det_jacobian = self.net[step](seq[:, step], cond[:, step])
-            seq_u.append(u)
+        for step in range(self.pred_len):
+            pos_prev, log_det_jacobian = self.net[step](seq[:, step], cond)
+            seq_prev.append(pos_prev)
             seq_log_det_jacobians.append(log_det_jacobian)
-        seq_u = torch.stack(seq_u, dim=1)
+        seq_prev = torch.stack(seq_prev, dim=1)
         seq_log_det_jacobians = torch.stack(seq_log_det_jacobians, dim=1)
-        return seq_u, seq_log_det_jacobians
+        return seq_prev, seq_log_det_jacobians
 
-    def inverse(self, u, cond):
+    def inverse(self, pos, cond):
         seq = []
         seq_log_det_jacobians = []
-        for step in range(cond.shape[2]):
-            u, log_det_jacobian = self.net[step].inverse(u, cond[:, :, step])
-            seq.append(u)
+        for step in range(self.pred_len):
+            pos, log_det_jacobian = self.net[step].inverse(pos, cond)
+            seq.append(pos)
             seq_log_det_jacobians.append(log_det_jacobian)
         seq = torch.stack(seq, dim=2)
         seq_log_det_jacobians = torch.stack(seq_log_det_jacobians, dim=2)
@@ -476,76 +425,52 @@ class FlowChain_separate(FlowChain):
 
 
 class FlowChain_separate_cond(FlowChain_separate):
-    def build_net(self, n_blocks, input_size, hidden_size, n_hidden, cond_label_size, **kwargs):
-        self.input_size = input_size
+    def build_net(self, n_blocks, input_size, hidden_size, n_hidden, cond_size, **kwargs):
         flow_key = kwargs['flow_architecture']
-        pred_len = kwargs['pred_len']
         # increase cond_label_size for conditioning trajectory
         self.net = nn.ModuleList([self.flow_dict[flow_key](n_blocks=n_blocks,
-                                                           input_size=self.input_size,
+                                                           input_size=input_size,
                                                            hidden_size=hidden_size,
                                                            n_hidden=n_hidden,
-                                                           cond_label_size=cond_label_size + i * self.input_size)
-                                  for i in range(pred_len)])
+                                                           cond_size=cond_size + i * input_size)
+                                  for i in range(self.pred_len)])
     
-    def forward_sequential(self, seq, cond, n_step=None):
-        x = seq[:, -1:].detach().clone()
-        batch_size, pred_len, *_ = seq.shape
-        seq_cond = seq.reshape(batch_size, pred_len * self.input_size)[:, None]
-        seq_log_det_jacobians_cumsum = 0
-        
-        start = len(self.net) - 1
-        stop = -1 if n_step is None else start - n_step
-        for step in range(start, stop, -1):
-            cond_cat = torch.cat([cond[:, step:], 
-                                seq_cond[..., :step * self.input_size].expand(-1, pred_len - step, -1)],
-                                dim=-1)        
-            x, log_det_jacobian = self.net[step](x, cond_cat)
-            seq_log_det_jacobians_cumsum += log_det_jacobian
-            if not step == 0:
-                x = torch.cat([seq[:, step-1:step], x], dim=1)
-                seq_log_det_jacobians_cumsum = torch.cat([torch.zeros_like(seq_log_det_jacobians_cumsum[:, 0:1]),
-                                                   seq_log_det_jacobians_cumsum], dim=1)
-        seq_u = x
-        seq_log_det_jacobians_cumsum /= torch.cumsum(torch.ones_like(seq_log_det_jacobians_cumsum), dim=1)
-        return seq_u, seq_log_det_jacobians_cumsum
-    
-
     def forward_separate(self, seq, cond):
         batch_size, pred_len, *_ = seq.shape
         seq_cond = seq.reshape(batch_size, pred_len * self.input_size)
-        seq_u = []
+        seq_prev = []
         seq_log_det_jacobians = []
-        for step in range(seq.shape[1]):
+        for step in range(self.pred_len):
             cond_cat = torch.cat(
-                [cond[:, step], seq_cond[:, :step * self.input_size]], dim=-1)
-            u, log_det_jacobian = self.net[step](seq[:, step], cond_cat)
-            seq_u.append(u)
+                [cond, seq_cond[:, :step * self.input_size]], dim=-1)
+            pos_prev, log_det_jacobian = self.net[step](seq[:, step], cond_cat)
+            seq_prev.append(pos_prev)
             seq_log_det_jacobians.append(log_det_jacobian)
-        seq_u = torch.stack(seq_u, dim=1)
+        seq_prev = torch.stack(seq_prev, dim=1)
         seq_log_det_jacobians = torch.stack(seq_log_det_jacobians, dim=1)
-        return seq_u, seq_log_det_jacobians
+        return seq_prev, seq_log_det_jacobians
 
-    def inverse(self, u, cond):
+    def inverse(self, pos, cond):
         seq = []
         seq_log_det_jacobians = []
-        batch_size, n_sample, _ = u.shape
-        for step in range(cond.shape[2]):
+        batch_size, n_sample, _ = pos.shape
+        for step in range(self.pred_len):
             if not step == 0:
                 seq_cond = torch.stack(seq, dim=2)
                 seq_cond = seq_cond.reshape(batch_size, n_sample, -1)
-                cond_cat = torch.cat([cond[:, :, step], seq_cond], dim=2)
-                u, log_det_jacobian = self.net[step].inverse(u, cond_cat)
+                cond_cat = torch.cat([cond, seq_cond], dim=2)
+                pos, log_det_jacobian = self.net[step].inverse(pos, cond_cat)
             else:
-                u, log_det_jacobian = self.net[step].inverse(
-                    u, cond[:, :, step])
-            seq.append(u)
+                pos, log_det_jacobian = self.net[step].inverse(
+                    pos, cond)
+            seq.append(pos)
             seq_log_det_jacobians.append(log_det_jacobian)
         seq = torch.stack(seq, dim=2)
         seq_log_det_jacobians = torch.stack(seq_log_det_jacobians, dim=2)
         seq_log_det_jacobians_cumsum = torch.cumsum(
             seq_log_det_jacobians, dim=2)
         seq_log_det_jacobians_cumsum /= torch.cumsum(torch.ones_like(seq_log_det_jacobians_cumsum), dim=2)
+        
         return seq, seq_log_det_jacobians_cumsum, seq_log_det_jacobians
 
 
@@ -553,7 +478,7 @@ def create_RealNVP_step(n_blocks,
                         input_size,
                         hidden_size,
                         n_hidden,
-                        cond_label_size=None,
+                        cond_size=None,
                         batch_norm=True):
 
     modules = []
@@ -561,7 +486,7 @@ def create_RealNVP_step(n_blocks,
     for i in range(n_blocks):
         modules += [
             LinearMaskedCoupling(
-                input_size, hidden_size, n_hidden, mask, cond_label_size
+                input_size, hidden_size, n_hidden, mask, cond_size
             )
         ]
         mask = 1 - mask
@@ -574,7 +499,7 @@ def create_MAF_step(n_blocks,
                     input_size,
                     hidden_size,
                     n_hidden,
-                    cond_label_size=None,
+                    cond_size=None,
                     activation="ReLU",
                     input_order="sequential",
                     batch_norm=True):
@@ -587,7 +512,7 @@ def create_MAF_step(n_blocks,
                 input_size,
                 hidden_size,
                 n_hidden,
-                cond_label_size,
+                cond_size,
                 activation,
                 input_order,
                 input_degrees,
@@ -599,277 +524,20 @@ def create_MAF_step(n_blocks,
     return FlowSequential(*modules)
 
 
-class Augment_VFlow(nn.Module):
-    def __init__(self, input_size, aug_size):
-        super(Augment_VFlow, self).__init__()
-
-        self.input_size = input_size
-        self.aug_size = aug_size
-
-        self.register_buffer("aug_dist_mean", torch.zeros(self.aug_size))
-        self.register_buffer("aug_dist_var", torch.ones(self.aug_size))
-
-    @property
-    def aug_dist(self):
-        return Normal(self.aug_dist_mean, self.aug_dist_var)
-
-    def split_z(self, z):
-        split_proportions = (self.input_size, self.aug_size)
-        return torch.split(z, split_proportions, dim=-1)
-
-    def forward(self, x):
-        e = self.aug_dist.sample(sample_shape=x.shape[:-1])
-        log_det_jacobian = -torch.sum(self.aug_dist.log_prob(e), dim=-1)
-        z = torch.cat([x, e], dim=-1)
-        return z, log_det_jacobian
-
-    def split(self, z):
-        x, e = self.split_z(z)
-        log_det_jacobian = torch.sum(self.aug_dist.log_prob(e), dim=-1)
-        return x, log_det_jacobian
-
-
-class FlowChain_VFlow(FlowChain):
-    def __init__(self,
-                 input_size: int,
-                 n_blocks: int,
-                 hidden_size: int,
-                 n_hidden: int,
-                 cond_label_size: int,
-                 aug_size: int = 4):
-        super().__init__(input_size,
-                         n_blocks,
-                         hidden_size,
-                         n_hidden,
-                         cond_label_size)
-
-        self.input_size = input_size
-        self.aug_size = aug_size
-        self.flow_dim = input_size + aug_size
-
-        self.augment = Augment_VFlow(input_size=self.input_size,
-                                     aug_size=self.aug_size)
-
-        self.net = create_RealNVP_step(n_blocks=n_blocks,
-                                       input_size=self.flow_dim,
-                                       hidden_size=hidden_size,
-                                       n_hidden=n_hidden,
-                                       cond_label_size=cond_label_size)
-        # self.net = create_MAF_step(n_blocks=n_blocks,
-        #                                input_size=self.flow_dim,
-        #                                hidden_size=hidden_size,
-        #                                n_hidden=n_hidden,
-        #                                cond_label_size=cond_label_size)
-
-    def forward_sequential(self, seq, cond):
-        seq, log_det_jacobian_aug = self.augment(seq)
-        log_det_jacobian_aug = log_det_jacobian_aug[-1:]
-        seq_u, seq_log_det_jacobians_cumsum = super().forward_sequential(seq, cond)
-        seq_log_det_jacobians_cumsum += log_det_jacobian_aug
-        seq_u, log_det_jacobian = self.augment.split(seq_u)
-        seq_log_det_jacobians_cumsum += log_det_jacobian
-        return seq_u, seq_log_det_jacobians_cumsum
-
-    def forward_separate(self, seq, cond):
-        seq, seq_log_det_jacobians_aug = self.augment(seq)
-        seq_u, seq_log_det_jacobians = super().forward_separate(seq, cond)
-        seq_log_det_jacobians += seq_log_det_jacobians_aug
-        seq_u, log_det_jacobian = self.augment.split(seq_u)
-        seq_log_det_jacobians += log_det_jacobian
-        return seq_u, seq_log_det_jacobians
-
-    def inverse(self, u, cond):
-        u, log_det_jacobian_aug = self.augment(u)
-        seq, seq_log_det_jacobians_cumsum, seq_log_det_jacobians = super().inverse(u, cond)
-        seq_log_det_jacobians_cumsum += log_det_jacobian_aug
-        seq, log_det_jacobian = self.augment.split(seq)
-        seq_log_det_jacobians_cumsum += log_det_jacobian
-        # TODO: need to consider augmentation gap in 'seq_log_det_jacobians'
-        return seq, seq_log_det_jacobians_cumsum, seq_log_det_jacobians
-
-
-class FlowChain_VFlow_separate(FlowChain_separate):
-    def __init__(self,
-                 input_size: int,
-                 n_blocks: int,
-                 hidden_size: int,
-                 n_hidden: int,
-                 cond_label_size: int,
-                 aug_size: int = 4,
-                 pred_len=8):
-        super().__init__(input_size,
-                         n_blocks,
-                         hidden_size,
-                         n_hidden,
-                         cond_label_size)
-
-        self.input_size = input_size
-        self.aug_size = aug_size
-        self.flow_dim = input_size + aug_size
-
-        self.augment = Augment_VFlow(input_size=self.input_size,
-                                     aug_size=self.aug_size)
-
-        self.net = nn.ModuleList([create_RealNVP_step(n_blocks=n_blocks,
-                                                      input_size=self.flow_dim,
-                                                      hidden_size=hidden_size,
-                                                      n_hidden=n_hidden,
-                                                      cond_label_size=cond_label_size)
-                                  for _ in range(pred_len)])
-        # self.net = nn.ModuleList([create_MAF_step(n_blocks=n_blocks,
-        #                                input_size=self.flow_dim,
-        #                                hidden_size=hidden_size,
-        #                                n_hidden=n_hidden,
-        #                                cond_label_size=cond_label_size)
-        #                           for _ in range(pred_len)])
-
-    def forward_sequential(self, seq, cond):
-        seq, log_det_jacobian_aug = self.augment(seq)
-        log_det_jacobian_aug = log_det_jacobian_aug[-1:]
-        seq_u, seq_log_det_jacobians_cumsum = super().forward_sequential(seq, cond)
-        seq_log_det_jacobians_cumsum += log_det_jacobian_aug
-        seq_u, log_det_jacobian = self.augment.split(seq_u)
-        seq_log_det_jacobians_cumsum += log_det_jacobian
-        return seq_u, seq_log_det_jacobians_cumsum
-
-    def forward_separate(self, seq, cond):
-        seq, seq_log_det_jacobians_aug = self.augment(seq)
-        seq_u, seq_log_det_jacobians = super().forward_separate(seq, cond)
-        seq_log_det_jacobians += seq_log_det_jacobians_aug
-        seq_u, log_det_jacobian = self.augment.split(seq_u)
-        seq_log_det_jacobians += log_det_jacobian
-        return seq_u, seq_log_det_jacobians
-
-    def inverse(self, u, cond):
-        u, log_det_jacobian_aug = self.augment(u)
-        seq, seq_log_det_jacobians_cumsum, seq_log_det_jacobians = super().inverse(u, cond)
-        seq_log_det_jacobians_cumsum += log_det_jacobian_aug
-        seq, log_det_jacobian = self.augment.split(seq)
-        seq_log_det_jacobians_cumsum += log_det_jacobian
-        # TODO: need to consider augmentation gap in 'seq_log_det_jacobians'
-        return seq, seq_log_det_jacobians_cumsum, seq_log_det_jacobians
-
-
-class FlowChain_VFlow_separate_cond(FlowChain_separate_cond):
-    def __init__(self,
-                 input_size: int,
-                 n_blocks: int,
-                 hidden_size: int,
-                 n_hidden: int,
-                 cond_label_size: int,
-                 aug_size: int = 4,
-                 pred_len=8):
-        super().__init__(input_size,
-                         n_blocks,
-                         hidden_size,
-                         n_hidden,
-                         cond_label_size)
-
-        self.input_size = input_size
-        self.aug_size = aug_size
-        self.flow_dim = input_size + aug_size
-
-        self.augment = Augment_VFlow(input_size=self.input_size,
-                                     aug_size=self.aug_size)
-
-        # increase cond_label_size for conditioning trajectory
-        self.net = nn.ModuleList([create_RealNVP_step(n_blocks=n_blocks,
-                                                      input_size=self.flow_dim,
-                                                      hidden_size=hidden_size,
-                                                      n_hidden=n_hidden,
-                                                      cond_label_size=cond_label_size + i * self.input_size)
-                                  for i in range(pred_len)])
-
-    def forward_sequential(self, seq, cond):
-        x = seq[-1:].detach().clone()
-        x, log_det_jacobian_aug = self.augment(x)
-        pred_len, batch_size, *_ = seq.shape
-        seq_cond = seq.transpose(0, 1).reshape(
-            batch_size, pred_len * self.input_size)[None]
-        seq_log_det_jacobians_cumsum = 0
-        for step in range(seq.shape[0]-1, -1, -1):
-            cond_cat = torch.cat([cond[step:],
-                                  seq_cond[..., :step * self.input_size].expand(pred_len - step, -1, -1)],
-                                 dim=-1)
-            x, log_det_jacobian = self.net[step](x, cond_cat)
-            seq_log_det_jacobians_cumsum += log_det_jacobian
-            if not step == 0:
-                x_, log_det_jacobian = self.augment(seq[step-1][None])
-                x = torch.cat([x_, x], dim=0)
-                seq_log_det_jacobians_cumsum = torch.cat([log_det_jacobian,
-                                                          seq_log_det_jacobians_cumsum], dim=0)
-        seq_log_det_jacobians_cumsum /= torch.cumsum(
-            torch.ones_like(seq_log_det_jacobians_cumsum), dim=0)
-        seq_log_det_jacobians_cumsum += log_det_jacobian_aug
-        seq_u, log_det_jacobian = self.augment.split(x)
-        seq_log_det_jacobians_cumsum += log_det_jacobian
-
-        return seq_u, seq_log_det_jacobians_cumsum
-
-    def forward_separate(self, seq, cond):
-        pred_len, batch_size, *_ = seq.shape
-        seq_cond = seq.transpose(0, 1).reshape(
-            batch_size, pred_len * self.input_size)
-        seq, log_det_jacobians_aug = self.augment(seq)
-        seq_u = []
-        seq_log_det_jacobians = []
-        for step in range(seq.shape[0]):
-            cond_cat = torch.cat(
-                [cond[step], seq_cond[..., :step * self.input_size]], dim=-1)
-            u, log_det_jacobian = self.net[step](seq[step], cond_cat)
-            seq_u.append(u)
-            seq_log_det_jacobians.append(log_det_jacobian)
-        seq_u = torch.stack(seq_u)
-        seq_log_det_jacobians = torch.stack(seq_log_det_jacobians)
-        seq_log_det_jacobians += log_det_jacobians_aug
-        seq_u, log_det_jacobian = self.augment.split(seq_u)
-        seq_log_det_jacobians += log_det_jacobian
-        return seq_u, seq_log_det_jacobians
-
-    def inverse(self, u, cond):
-        seq = []
-        seq_c = []
-        seq_log_det_jacobians = []
-        n_sample, batch_size, _ = u.shape
-        u, log_det_jacobian_aug = self.augment(u)
-        for step in range(cond.shape[0]):
-            if not step == 0:
-                seq_cond = torch.stack(seq_c).transpose(0, 1).transpose(1, 2)
-                seq_cond = seq_cond.reshape(n_sample, batch_size, -1)
-                cond_cat = torch.cat([cond[step], seq_cond], dim=-1)
-                u, log_det_jacobian = self.net[step].inverse(u, cond_cat)
-            else:
-                u, log_det_jacobian = self.net[step].inverse(u, cond[step])
-            seq.append(u)
-            seq_c.append(u[..., :self.input_size])
-            seq_log_det_jacobians.append(log_det_jacobian)
-        seq = torch.stack(seq)
-        seq_log_det_jacobians = torch.stack(seq_log_det_jacobians)
-        seq_log_det_jacobians_cumsum = torch.cumsum(
-            seq_log_det_jacobians, dim=0)
-        seq_log_det_jacobians_cumsum /= torch.cumsum(
-            torch.ones_like(seq_log_det_jacobians_cumsum), dim=0)
-        seq_log_det_jacobians_cumsum += log_det_jacobian_aug
-        seq, log_det_jacobian = self.augment.split(seq)
-        seq_log_det_jacobians_cumsum += log_det_jacobian
-        # TODO: need to consider augmentation gap in 'seq_log_det_jacobians'
-        return seq, seq_log_det_jacobians_cumsum, seq_log_det_jacobians
-
-
 class DiagonalGaussianConditionalDensity(nn.Module):
     def __init__(self,
                  cond_dim,
                  out_dim) -> None:
         super().__init__()
         self.shift_net = get_mlp(
-            cond_dim, [cond_dim * 2] * 2, out_dim, nn.ReLU)
+            cond_dim, [out_dim] * 2, out_dim, nn.ReLU)
 
         self.log_scale_net = get_mlp(
-            cond_dim, [cond_dim * 2] * 2, out_dim, nn.ReLU)
+            cond_dim, [out_dim] * 2, out_dim, nn.ReLU)
 
-    def log_prob(self, z, cond_inputs):
+    def log_prob(self, u, cond_inputs):
         means, log_stddevs = self._means_and_log_stddevs(cond_inputs)
-        return diagonal_gaussian_log_prob(z, means, log_stddevs)
+        return diagonal_gaussian_log_prob(u, means, log_stddevs)
 
     def sample(self, cond_inputs):
         means, log_stddevs = self._means_and_log_stddevs(cond_inputs)
@@ -879,16 +547,16 @@ class DiagonalGaussianConditionalDensity(nn.Module):
         return self.shift_net(cond_inputs), self.log_scale_net(cond_inputs)
 
 
-def diagonal_gaussian_log_prob(w, means, log_stddevs):
-    assert means.shape == log_stddevs.shape == w.shape
+def diagonal_gaussian_log_prob(u, means, log_stddevs):
+    assert means.shape == log_stddevs.shape == u.shape
 
     vars = torch.exp(log_stddevs)**2
 
-    *_, dim = w.shape
+    *_, dim = u.shape
 
     const_term = -.5*dim*np.log(2*np.pi)
     log_det_terms = -torch.sum(log_stddevs, dim=-1)
-    product_terms = -.5*torch.sum((w - means)**2 / vars, dim=-1)
+    product_terms = -.5*torch.sum((u - means)**2 / vars, dim=-1)
 
     return const_term + log_det_terms + product_terms
 
@@ -926,70 +594,65 @@ class CIF_step(nn.Module):
     def __init__(self,
                  bijection,
                  input_size,
-                 cond_label_size=None) -> None:
+                 cond_size) -> None:
         super().__init__()
         self.bijection = bijection
-        self.cond_label_size = cond_label_size
-        self.r_u_given_z = DiagonalGaussianConditionalDensity(
-            input_size + cond_label_size, cond_label_size)
-        self.q_u_given_w = DiagonalGaussianConditionalDensity(
-            input_size + cond_label_size, cond_label_size)
+        self.cond_size = cond_size
+        self.r_u_given_x = DiagonalGaussianConditionalDensity(
+            input_size + cond_size, cond_size)
+        self.q_u_given_z = DiagonalGaussianConditionalDensity(
+            input_size + cond_size, cond_size)
 
-    def forward(self, z, y):
-        u, log_r_u = self.r_u_given_z.sample(torch.cat([z, y], dim=-1))
-        w, log_det_jac = self.bijection.forward(z, u)
-        log_q_u = self.q_u_given_w.log_prob(u, torch.cat([w, y], dim=-1))
-
-        return w, log_det_jac + log_q_u - log_r_u
-
-    def inverse(self, w, y):
-        u, log_q_u = self.q_u_given_w.sample(torch.cat([w, y], dim=-1))
-        z, log_det_jac = self.bijection.inverse(w, u)
-        log_r_u = self.r_u_given_z.log_prob(u, torch.cat([z, y], dim=-1))
+    def forward(self, x, y):
+        u, log_r_u = self.r_u_given_x.sample(torch.cat([x, y], dim=-1))
+        z, log_det_jac = self.bijection.forward(x, u)
+        log_q_u = self.q_u_given_z.log_prob(u, torch.cat([z, y], dim=-1))
 
         return z, log_det_jac + log_q_u - log_r_u
 
+    def inverse(self, z, y):
+        u, log_q_u = self.q_u_given_z.sample(torch.cat([z, y], dim=-1))
+        x, log_det_jac = self.bijection.inverse(z, u)
+        log_r_u = self.r_u_given_x.log_prob(u, torch.cat([x, y], dim=-1))
+        
+        return x, log_det_jac + log_q_u - log_r_u
+
 
 class FlowChain_CIF(FlowChain):
-    def build_net(self, n_blocks, input_size, hidden_size, n_hidden, cond_label_size, **kwargs):
-        self.input_size = input_size
+    def build_net(self, n_blocks, input_size, hidden_size, n_hidden, cond_size, **kwargs):
         flow_key = kwargs['flow_architecture']
         bijection = self.flow_dict[flow_key](n_blocks=n_blocks,
-                                             input_size=self.input_size,
+                                             input_size=input_size,
                                              hidden_size=hidden_size,
                                              n_hidden=n_hidden,
-                                             cond_label_size=cond_label_size)
+                                             cond_size=cond_size)
 
         self.net = CIF_step(bijection,
-                            input_size=self.input_size,
-                            cond_label_size=cond_label_size)
+                            input_size=input_size,
+                            cond_size=cond_size)
 
 
 class FlowChain_CIF_separate(FlowChain_separate):
-    def build_net(self, n_blocks, input_size, hidden_size, n_hidden, cond_label_size, **kwargs):
-        self.input_size = input_size
+    def build_net(self, n_blocks, input_size, hidden_size, n_hidden, cond_size, **kwargs):
         flow_key = kwargs['flow_architecture']
-        pred_len = kwargs['pred_len']
         self.net = nn.ModuleList([CIF_step(self.flow_dict[flow_key](n_blocks=n_blocks,
-                                                                    input_size=self.input_size,
+                                                                    input_size=input_size,
                                                                     hidden_size=hidden_size,
                                                                     n_hidden=n_hidden,
-                                                                    cond_label_size=cond_label_size),
+                                                                    cond_size=cond_size),
                                            input_size,
-                                           cond_label_size)
-                                  for _ in range(pred_len)])
+                                           cond_size)
+                                  for _ in range(self.pred_len)])
 
 
 class FlowChain_CIF_separate_cond(FlowChain_separate_cond):
-    def build_net(self, n_blocks, input_size, hidden_size, n_hidden, cond_label_size, **kwargs):
-        self.input_size = input_size
+    def build_net(self, n_blocks, input_size, hidden_size, n_hidden, cond_size, **kwargs):
         flow_key = kwargs['flow_architecture']
-        pred_len = kwargs['pred_len']
         self.net = nn.ModuleList([CIF_step(self.flow_dict[flow_key](n_blocks=n_blocks,
-                                                                    input_size=self.input_size,
+                                                                    input_size=input_size,
                                                                     hidden_size=hidden_size,
                                                                     n_hidden=n_hidden,
-                                                                    cond_label_size=cond_label_size + i * self.input_size),
+                                                                    cond_size=cond_size + i * input_size),
                                            input_size,
-                                           cond_label_size + i * self.input_size)
-                                  for i in range(pred_len)])
+                                           cond_size + i * input_size)
+                                  for i in range(self.pred_len)])

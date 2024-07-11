@@ -8,13 +8,10 @@ import torch
 import seaborn as sns
 from matplotlib import pyplot as plt
 from torch.distributions.normal import Normal
-
-from scipy.cluster.hierarchy import linkage, fcluster
-from scipy.interpolate import griddata, RBFInterpolator, interp2d
+from scipy.interpolate import griddata, RBFInterpolator, LinearNDInterpolator
 
 from keepflow.visualization import Visualizer
 from keepflow.visualization import plot_density
-from keepflow.data.traj.trajectron_dataset import get_hypers
 from keepflow.utils import EmptyEnv
 
 class TrajVisualizer(Visualizer):
@@ -29,17 +26,8 @@ class TrajVisualizer(Visualizer):
         self.obs_len = cfg.DATA.OBSERVE_LENGTH
         self.pred_len = cfg.DATA.PREDICT_LENGTH
         
-        # # TODO: params for other nodes
-        # hypers = get_hypers(cfg)
-        # node = 'PEDESTRIAN'
-        # self.state = hypers[cfg.DATA.TRAJ.PRED_STATE][node]
-        # mean, std = self.env.get_standardize_params(self.state, node)
-        # self.mean = mean
-        # self.std = std
-        # self.std = self.env.attention_radius[('PEDESTRIAN', 'PEDESTRIAN')]
-        
-        #self.num_grid = 500  # for visualization
-        self.num_grid = 100
+        self.num_grid = 500  # for detailed visualization
+        # self.num_grid = 100
         
         if 'sim' in self.dataset:
             import dill
@@ -60,8 +48,13 @@ class TrajVisualizer(Visualizer):
         # (batch, timesteps, [x,y])
         obs = self.to_numpy(dict_list[0]['obs'][:, :, 0:2])
         gt = self.to_numpy(dict_list[0]['gt'])
-        neighbor = [self.to_numpy(n) for n in dict_list[0]['neighbors']]
-        neighbor_gt = [self.to_numpy(n) for n in dict_list[0]['neighbors_gt']]
+        
+        if len(dict_list[0]['neighbors']) == 0:
+            neighbor = np.zeros([len(obs), 0, 1, 2])
+            neighbor_gt = np.zeros([len(obs), 0, 1, 2])
+        else:
+            neighbor = [self.to_numpy(n) for n in dict_list[0]['neighbors']]
+            neighbor_gt = [self.to_numpy(n) for n in dict_list[0]['neighbors_gt']]
         
         pred = []
         for d in dict_list:
@@ -82,8 +75,7 @@ class TrajVisualizer(Visualizer):
                                      max_pos,
                                      min_pos)
         
-        # if ("prob", 0) in dict_list[0]:
-        if False:
+        if ("prob", 0) in dict_list[0]:
             path_density_map = self.output_dir / "density_map"
             path_density_map.mkdir(exist_ok=True)
             
@@ -127,21 +119,24 @@ class TrajVisualizer(Visualizer):
                 for k in list(data_dict.keys()):
                     if k[0] == "prob":
                         prob = data_dict[k]
+                        
+                        # samples with probability
                         if type(prob) == torch.Tensor:
                             prob = self.to_numpy(prob)
                             batch, _, timesteps, _ = prob.shape
                         
                             zz_batch = []                          
                             for i in range(batch):
-                                zz_timesteps = Parallel(n_jobs=timesteps)(delayed(self.griddata_on_cluster)(i, prob, xx, yy, max_pos, min_pos, j)
-                                                                    for j in range(timesteps))
-                                # zz_timesteps = [self.griddata_on_cluster(i, prob, xx, yy, max_pos, min_pos, j) for j in range(timesteps)]
+                                # zz_timesteps = Parallel(n_jobs=timesteps)(delayed(self.griddata_on_cluster)(i, prob, xx, yy, max_pos, min_pos, j)
+                                #                                     for j in range(timesteps))
+                                zz_timesteps = [self.griddata_on_cluster(i, prob, xx, yy, max_pos, min_pos, j) for j in range(timesteps)]
                                 zz_timesteps = np.stack(zz_timesteps, axis=-1).reshape(-1, timesteps)
                                 zz_batch.append(zz_timesteps)
                             
                             zz_batch = np.stack(zz_batch, axis=0)
                             data_dict[k] = zz_batch
                             
+                        # gaussian mixture model
                         elif self.model_name == "Trajectron" or self.model_name == "GT_Dist":
                             value = torch.Tensor(np.array([xx.flatten(), yy.flatten()])).transpose(0, 1)[None, :, None].tile(1, 1, prob.mus.shape[2], 1).to(self.device)
                             if self.model_name == 'GT_Dist':
@@ -150,6 +145,7 @@ class TrajVisualizer(Visualizer):
                             zz_batch = self.to_numpy(torch.exp(prob.log_prob(value)))
                             data_dict[k] = zz_batch
                             
+                        # kernel density estimation
                         else:
                             zz_batch = []
                             for i in range(len(prob)):
@@ -165,15 +161,19 @@ class TrajVisualizer(Visualizer):
                         if ("gt_traj_log_prob", k[1]) not in data_dict:
                             gt = data_dict["gt"][:, k[1]:].cpu()
                             timesteps = gt.shape[1]
-                            
-                            gt_traj_prob = np.array([interp2d(xx, yy, zz_batch[:, :, t])(gt[:, t, 0], gt[:, t, 1]) for t in range(timesteps)])
+                            points = np.stack([xx.flatten(), yy.flatten()], axis=1)
+                            gt_traj_prob = []
+                            for i in range(len(zz_batch)):
+                                gt_traj_prob_ = np.array([LinearNDInterpolator(points, zz_batch[i, :, t])(gt[i, t, 0], gt[i, t, 1]) for t in range(timesteps)])
+                                gt_traj_prob.append(gt_traj_prob_)
+                            gt_traj_prob = np.stack(gt_traj_prob, axis=0)
                             gt_traj_log_prob = torch.log(torch.Tensor(gt_traj_prob)).squeeze()
                             if torch.sum(torch.isnan(gt_traj_log_prob) + torch.isinf(gt_traj_log_prob)) > 0:
                                 mask = torch.isnan(gt_traj_log_prob) + torch.isinf(gt_traj_log_prob)
                                 try:
                                     value = torch.min(gt_traj_log_prob[~mask])
                                 except:
-                                    import pdb;pdb.set_trace()
+                                    value = -100
                                 gt_traj_log_prob = torch.nan_to_num(gt_traj_log_prob, nan=value, neginf=value)
                             data_dict[("gt_traj_log_prob", k[1])] = gt_traj_log_prob[None]
                         
@@ -234,57 +234,33 @@ class TrajVisualizer(Visualizer):
         prob_ = prob[i, :, j]
         prob_ = prob_[np.where(np.isinf(prob_).sum(axis=1) == 0)]
         prob_ = prob_[np.where(np.isnan(prob_).sum(axis=1) == 0)]
-        lnk = linkage(prob_[:, :-1],
-                        method='single',
-                        metric='euclidean')
-        idx_cls = fcluster(lnk, t=np.linalg.norm(max_pos-min_pos)*0.003, 
-                            criterion='distance')
-        idx_cls -= 1
         
-        zz_ = []
-        """
-        xs = np.linspace(min_pos[0], max_pos[0], num=300)
-        ys = np.linspace(min_pos[1], max_pos[1], num=300)
+        zz = griddata(prob_[..., :-1],
+                    prob_[..., -1],
+                    (xx, yy), method='linear',
+                    fill_value=0.0)
+    
+        # avoid extrapolation
+        from scipy.spatial import KDTree
+        threshold_pixels = 0.5
+        threshold_meter = np.linalg.norm(max_pos - min_pos) / np.mean(xx.shape) * threshold_pixels
         
-        upper = np.array([xs, np.ones_like(xs) * min_pos[1], np.ones_like(xs) * 0.0]).T
-        bottom = np.array([xs, np.ones_like(xs) * max_pos[1], np.ones_like(xs) * 0.0]).T
-        right = np.array([np.ones_like(ys) * max_pos[0], ys, np.ones_like(ys) * 0.0]).T
-        left = np.array([np.ones_like(ys) * min_pos[0], ys, np.ones_like(ys) * 0.0]).T
-        boundary = np.concatenate([upper, bottom, right, left], axis=0)
-        prob_ = np.concatenate([prob[i, :, j], boundary], axis=0)
+        mask = np.stack([xx, yy], axis=-1).reshape([-1, 2])
+        tree = KDTree(prob_[..., :-1])
+        mask = tree.query(mask)[0] < threshold_meter
+        mask = mask.reshape(xx.shape)
+        zz = mask * zz
         
+        intp = RBFInterpolator(
+            np.array([xx, yy]).reshape(2, -1).T, zz.flatten(),
+            smoothing=1, kernel='linear', neighbors=8)
         
-        intp = RBFInterpolator(prob_[:, :-1],
-                               prob_[:, -1],
-                               smoothing=10, kernel='linear')
-        zz__ = intp(np.array([xx, yy]).transpose().reshape(-1, 2))
-        zz_.append(zz__.reshape(xx.shape).T)
-        """
-        for c in range(np.max(idx_cls)+1):
-            try:
-                zz_.append(griddata(prob_[idx_cls == c, :-1],
-                                prob_[idx_cls == c, -1],
-                                (xx, yy), method='linear',
-                                fill_value=0.0)
-                           )
-            except:
-                pass
-        
-        zz = sum(zz_)
-        
-        intp = RBFInterpolator(np.array([xx, yy]).reshape(2, -1).T, zz.flatten(), smoothing=10, kernel='linear', neighbors=8)
         zz = intp(np.array([xx, yy]).reshape(2, -1).T).reshape(xx.shape)
         
         prob_ = prob[i, :, j, -1]
         prob_ = prob_[~np.isnan(prob_)]
         zz = np.clip(zz, a_min=0.0, a_max=np.percentile(prob_, 95))
         
-        
-        #zz /= np.sum(zz)
-        
-        #plot_density(
-        #    xx, yy, zz, path=path_density_map / f"update{update_step}_{index[0]}_{index[1]}_{index[2].strip('PEDESTRIAN/')}_{j}.png",
-        #    traj=traj)
         return zz
 
     def plot2d_trajectories(self,

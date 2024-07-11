@@ -38,16 +38,15 @@ class ModelTemplate(nn.Module):
         self.pred_len = cfg.DATA.PREDICT_LENGTH
         
     @abstractmethod
-    def predict_from_new_obs(self, data_dict: Dict, time_step: int) -> Dict:
-        return data_dict
-
+    def training_step(self, data_dict) -> None:
+        pass
+        
     @abstractmethod
     def predict(self, data_dict: Dict, return_prob=False) -> Dict:
         pass
 
-    @abstractmethod
-    def update(self, data_dict) -> None:
-        pass
+    def update_from_new_obs(self, data_dict: Dict, time_step: int) -> Dict:
+        return data_dict
     
     def save(self, epoch: int = 0, path: Path=None) -> None:
         if path is None:

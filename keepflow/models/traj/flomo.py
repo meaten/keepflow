@@ -161,10 +161,7 @@ class FloMo(ModelTemplate):
             
         return data_dict
     
-    def predict_from_new_obs(self, data_dict, time_step: int):
-        return data_dict
-    
-    def update(self, data_dict):
+    def training_step(self, data_dict):
         x = data_dict['obs']
         y_true = data_dict['gt']
         train_loss = -self.log_prob(y_true, x).mean()

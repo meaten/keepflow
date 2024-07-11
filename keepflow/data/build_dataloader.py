@@ -7,21 +7,28 @@
 
 from typing import Tuple
 from collections.abc import Callable
+from itertools import product
 from pathlib import Path
 import dill
 from yacs.config import CfgNode
+import random
+import numpy as np
+import torch
 from torch.utils.data import Dataset, DataLoader
-from trajdata import UnifiedDataset
+
+
+def worker_init_fn(worker_id):                                                          
+    np.random.seed(np.random.get_state()[1][0] + worker_id)
 
 
 def build_dataloader(cfg: CfgNode, rand=True, split="train", batch_size=None) -> DataLoader:
     # train, val, test
     if cfg.DATA.TASK == "traj":
-        dataset, collate_fn = build_traj_dataloader(cfg, split)
+        dataset, collate_fn = build_traj_dataset(cfg, split)
     elif cfg.DATA.TASK == "motion":
-        dataset, collate_fn = build_motion_dataloader(cfg, split)
+        dataset, collate_fn = build_motion_dataset(cfg, split)
     elif cfg.DATA.TASK == "video":
-        dataset, collate_fn = build_video_dataloader(cfg, split)
+        dataset, collate_fn = build_video_dataset(cfg, split)
     else:
         raise ValueError        
     
@@ -31,31 +38,38 @@ def build_dataloader(cfg: CfgNode, rand=True, split="train", batch_size=None) ->
         dataset,
         batch_size=batch_size,
         shuffle=rand,
-        num_workers=cfg.DATA.NUM_WORKERS,
+        num_workers=min(cfg.DATA.NUM_WORKERS, len(dataset)),
         collate_fn=collate_fn,
         drop_last=True if split == 'train' else False,
-        pin_memory=True)
+        worker_init_fn=worker_init_fn,
+        # pin_memory=True,
+        # prefetch_factor=4,
+        # persistent_workers=True,
+        )
     
     return loader
 
 
-def build_traj_dataloader(cfg: CfgNode, split: str) -> Tuple[Dataset, Callable] :
+def build_traj_dataset(cfg: CfgNode, split: str) -> Tuple[Dataset, Callable] :
+    
     # train, val, test
-    if 'sim' in cfg.DATA.DATASET_NAME:
+    if 'sim' in cfg.DATA.DATASET_NAME or cfg.DATA.DATASET_NAME == 'sdd':
         from .traj.trajectron_dataset import EnvironmentDataset, get_hypers
-        hypers = get_hypers(cfg)        
+        hypers = get_hypers(cfg)
         
+        if cfg.DATA.DATASET_NAME == 'sdd' and split == 'val':
+            split = 'test'
         env_path = Path(cfg.DATA.PATH) / cfg.DATA.TASK / 'processed_data' / f"{cfg.DATA.DATASET_NAME}_{split}.pkl"
         with open(env_path, 'rb') as f:
             env = dill.load(f, encoding='latin1')
-
+                
         dataset = EnvironmentDataset(env,
                                     state=hypers[cfg.DATA.TRAJ.STATE],
                                     pred_state=hypers[cfg.DATA.TRAJ.PRED_STATE],
                                     node_freq_mult=hypers['scene_freq_mult_train'],
                                     scene_freq_mult=hypers['node_freq_mult_train'],
                                     hyperparams=hypers,
-                                    min_history_timesteps=1 if cfg.DATA.TRAJ.ACCEPT_NAN and split == 'train' else cfg.DATA.OBSERVE_LENGTH,
+                                    min_history_timesteps=3 if cfg.DATA.TRAJ.ACCEPT_NAN and split == 'train' else cfg.DATA.OBSERVE_LENGTH - 1,
                                     min_future_timesteps=cfg.DATA.PREDICT_LENGTH,
                                     #augment=hypers['augment'] and split == 'train'
                                     )
@@ -64,28 +78,50 @@ def build_traj_dataloader(cfg: CfgNode, split: str) -> Tuple[Dataset, Callable] 
             if d.node_type == 'PEDESTRIAN':
                 dataset = d
                 break
-
+        
         from .traj.preprocessing import dict_collate as seq_collate
             
-    elif cfg.DATA.DATASET_NAME == 'jrdb':
+    elif cfg.DATA.DATASET_NAME == 'jrdb':    
         from .traj.jrdb_dataset import JRDB_Dataset
         dataset = JRDB_Dataset(cfg, split)
         from .traj.jrdb_dataset import jrdb_collate as seq_collate
     else:
-        agent_interaction_distances = {(2,2): 3.0}
+        from trajdata import UnifiedDataset
+        from trajdata.data_structures import AgentType
+        from trajdata.augmentation import NoiseHistories
         
         if cfg.DATA.DATASET_NAME in ['eth', 'hotel', 'univ', 'zara1', 'zara2']:
             desired_dt = 0.4
-            history_sec =(desired_dt, (cfg.DATA.OBSERVE_LENGTH - 1) * desired_dt) if cfg.DATA.TRAJ.ACCEPT_NAN and split == 'train' else ((cfg.DATA.OBSERVE_LENGTH - 1) * desired_dt,) * 2
+            # history_sec =(desired_dt, (cfg.DATA.OBSERVE_LENGTH - 1) * desired_dt) if cfg.DATA.TRAJ.ACCEPT_NAN and split == 'train' else ((cfg.DATA.OBSERVE_LENGTH - 1) * desired_dt,) * 2
+            history_sec = ((cfg.DATA.OBSERVE_LENGTH - 1) * desired_dt,) * 2
             future_sec = ((cfg.DATA.PREDICT_LENGTH) * desired_dt,) * 2
-            agent_interaction_distances = {(2,2): 3.0}
-            # state_format = "x,y,xd,yd,xdd,ydd"
-            # obs_format = "x,y,xd,yd,xdd,ydd"
+            agent_list = [AgentType.PEDESTRIAN]
+            agent_interaction_distances = {(2,2): 3.0,}  # ped-ped
             
             desired_data = f"eupeds_{cfg.DATA.DATASET_NAME}"
             desired_split = desired_data + f"-{split}_loo"
             data_dir = Path(cfg.DATA.PATH) / cfg.DATA.TASK / 'raw' / 'all_data'
+        
+        # turned out to be different settings from the conventional evaluation
+        # elif cfg.DATA.DATASET_NAME == 'sdd':
+        #     desired_dt = 0.4
+        #     history_sec =(desired_dt, (cfg.DATA.OBSERVE_LENGTH - 1) * desired_dt) if cfg.DATA.TRAJ.ACCEPT_NAN and split == 'train' else ((cfg.DATA.OBSERVE_LENGTH - 1) * desired_dt,) * 2
+        #     future_sec = ((cfg.DATA.PREDICT_LENGTH) * desired_dt,) * 2
+        #     agent_list = [AgentType.UNKNOWN, AgentType.PEDESTRIAN, AgentType.BICYCLE, AgentType.VEHICLE]
+        #     agent_interaction_distances = {c: 10.0 for c in product(agent_list, repeat=2)}
+        #     agent_interaction_distances[(2,2)] = 3.0  # ped-ped
             
+        #     desired_data = "sdd"
+        
+        #     desired_split = desired_data + f"-{split}"
+        #     data_dir = Path(cfg.DATA.PATH) / cfg.DATA.TASK / 'StanfordDroneDataset'
+            
+        cache_path = Path(cfg.DATA.PATH) / cfg.DATA.TASK / 'cache'
+            
+        noise_hists = NoiseHistories()
+        standardize_data = True
+        standardize_derivatives = False
+        
         dataset = UnifiedDataset(
             desired_data=[desired_split],
             data_dirs={  # Remember to change this to match your filesystem!
@@ -94,32 +130,29 @@ def build_traj_dataloader(cfg: CfgNode, split: str) -> Tuple[Dataset, Callable] 
             history_sec=history_sec,
             future_sec=future_sec,
             agent_interaction_distances = agent_interaction_distances,
-            # state_format=state_format,  # cause error
-            # obs_format=obs_format,
+            only_types=agent_list,
+            only_predict=[AgentType.PEDESTRIAN],  # ped
             desired_dt=desired_dt,
-            standardize_data=False,
-            centric='agent'
+            standardize_data=standardize_data,
+            standardize_derivatives=standardize_derivatives,
+            centric='agent',
+            augmentations=[noise_hists] if split == 'train' else None,
+            cache_location=str(cache_path),
         )
-        cache_path = Path(cfg.DATA.PATH) / cfg.DATA.TASK / 'cache'
-        cache_path.mkdir(exist_ok=True)
-        if split == 'train':
-            cache_path = cache_path / f'{desired_split}_nan_{str(cfg.DATA.TRAJ.ACCEPT_NAN)}'
-        else:
-            cache_path = cache_path / desired_split
-        # dataset.load_or_create_cache(
-        #     str(cache_path), num_workers=cfg.DATA.NUM_WORKERS, filter_fn=None
-        # )
-
+        
         from .traj.collate_wrapper import CollateWrapper
         if cfg.DATA.DATASET_NAME == 'eth' and split == 'test':
-            seq_collate = CollateWrapper(cfg, dataset.get_collate_fn(), scale=0.6)
+            scale = cfg.DATA.TRAJ.SCALE * 0.6
         else:
-            seq_collate = CollateWrapper(cfg, dataset.get_collate_fn(), scale=1.0)
-
+            scale = cfg.DATA.TRAJ.SCALE
+        seq_collate = CollateWrapper(cfg, dataset.get_collate_fn(),
+                                     scale=scale,
+                                     standardize_data=standardize_data,
+                                     standardize_derivatives=standardize_derivatives)
     return dataset, seq_collate
 
 
-def build_motion_dataloader(cfg: CfgNode, split: str) -> Tuple[Dataset, Callable]:
+def build_motion_dataset(cfg: CfgNode, split: str) -> Tuple[Dataset, Callable]:
     # train, val, test
     if cfg.DATA.DATASET_NAME == "h36motion":
         import os
@@ -166,7 +199,7 @@ def build_motion_dataloader(cfg: CfgNode, split: str) -> Tuple[Dataset, Callable
     return dataset, seq_collate
 
 
-def build_video_dataloader(cfg: CfgNode, split: str) -> Tuple[Dataset, Callable]:
+def build_video_dataset(cfg: CfgNode, split: str) -> Tuple[Dataset, Callable]:
     # only train, test
     from data.video.datasets_factory import video_dataset
     if cfg.DATA.DATASET_NAME == "bair":

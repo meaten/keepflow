@@ -80,7 +80,7 @@ class LED(ModelTemplate, Trainer):
         
         return data_dict
 
-    def update(self, data_dict) -> None:
+    def training_step(self, data_dict) -> None:
         partitioning_index, batch_size, traj_mask, past_traj, fut_traj = self.data_preprocess(data_dict)
         
         sample_prediction, mean_estimation, variance_estimation = self.model_initializer(past_traj, traj_mask)

@@ -5,6 +5,7 @@ from torch.utils.data._utils.collate import default_collate
 import dill
 from copy import deepcopy
 from .environment import NodeType
+from trajdata.data_structures import AgentType
 container_abcs = collections.abc
 
 
@@ -23,24 +24,18 @@ def restore(data):
 def dict_collate(batch):
     batch = collate(batch)
     (first_history_index, x_t, y_t, x_st_t, y_st_t,
-     neighbors_data_st, neighbors_gt_st, neighbors_edge_value,
+     neighbors_data_st, neighbors_gt_st, neighbors_type,
      robot_traj_st_t, map_tuple, dt, index, node_type) = batch
     
     out = {
         "index": index,
-        # "obs": x_t,
-        # "gt": y_t,
         "obs": x_st_t,
         "gt": y_st_t,
-        # "obs_st": x_st_t,
-        # "gt_st": y_st_t,
-        # "neighbors_st": restore(neighbors_data_st),
-        # "neighbors_gt_st": restore(neighbors_gt_st),
-        "neighbors": torch.Tensor([]),  # only for synthesized data, value should be []
-        "neighbors_gt": torch.Tensor([]),  # only for synthesized data, value should be []
-        'agent_type': torch.Tensor([2] * len(x_st_t)),  # only for synthesized data, value should be []
-        "neighbor_type": torch.Tensor([]),  # only for synthesized data, value should be []
-        "curr_state": x_t[:, -1],
+        "neighbors": neighbors_data_st,
+        "neighbors_gt": neighbors_gt_st,
+        'agent_type': torch.tensor([AgentType.PEDESTRIAN] * len(x_st_t)),
+        "neighbor_type": neighbors_type,
+        "standardize_offset": torch.zeros_like(x_t[:, [-1]]),
         "robot_traj": robot_traj_st_t,
         "map": map_tuple,
         "dt": dt,
@@ -148,6 +143,7 @@ def get_node_timestep_data(env, scene, t, node, state, pred_state,
     neighbors_data_st = None
     neighbors_edge_value = None
     if hyperparams['edge_encoding']:
+        max_neighbors = 20
         # Scene Graph
         scene_graph = scene.get_scene_graph(t,
                                             env.attention_radius,
@@ -156,19 +152,23 @@ def get_node_timestep_data(env, scene, t, node, state, pred_state,
 
         neighbors_data_st = dict()
         neighbors_gt_st = dict()
-        neighbors_edge_value = dict()
+        neighbors_type = dict()
         for edge_type in edge_types:
             neighbors_data_st[edge_type] = list()
             neighbors_gt_st[edge_type] = list()
             # We get all nodes which are connected to the current node for the current timestep
             connected_nodes = scene_graph.get_neighbors(node, edge_type[1])
 
-            if hyperparams['dynamic_edges'] == 'yes':
-                # We get the edge masks for the current node at the current timestep
-                edge_masks = torch.tensor(scene_graph.get_edge_scaling(node), dtype=torch.float)
-                neighbors_edge_value[edge_type] = edge_masks
+            # if hyperparams['dynamic_edges'] == 'yes':
+            #     # We get the edge masks for the current node at the current timestep
+            #     edge_masks = torch.tensor(scene_graph.get_edge_scaling(node), dtype=torch.float)
+            #     neighbors_edge_value[edge_type] = edge_masks
+            
+            neighbors_data_st_t = torch.ones([max_neighbors, *x_st_t.shape]) * float('nan')
+            neighbors_gt_st_t = torch.ones([max_neighbors, *y_st_t.shape]) * float('nan')
+            neighbors_type = torch.ones([max_neighbors]) * -1
 
-            for connected_node in connected_nodes:
+            for i, connected_node in enumerate(connected_nodes):
                 neighbor_state_np = connected_node.get(timestep_range_x,
                                                        state[connected_node.type],
                                                        padding=0.0)
@@ -199,9 +199,10 @@ def get_node_timestep_data(env, scene, t, node, state, pred_state,
 
                 neighbor_state = torch.tensor(neighbor_state_np_st, dtype=torch.float)
                 neighbor_gt = torch.tensor(neighbor_gt_np_st, dtype=torch.float)
-                neighbors_data_st[edge_type].append(neighbor_state)
-                neighbors_gt_st[edge_type].append(neighbor_gt)
-
+                neighbors_data_st_t[i] = neighbor_state
+                neighbors_gt_st_t[i] = neighbor_gt
+                neighbors_type[i] = AgentType[edge_type[1]].value
+        
     # Robot
     robot_traj_st_t = None
     timestep_range_r = np.array([t, t + max_ft])
@@ -240,8 +241,8 @@ def get_node_timestep_data(env, scene, t, node, state, pred_state,
             patch_size = hyperparams['map_encoder'][node.type]['patch_size']
             map_tuple = (scene_map, map_point, heading_angle, patch_size)
 
-    return (first_history_index, x_t, y_t, x_st_t, y_st_t, neighbors_data_st, neighbors_gt_st,
-            neighbors_edge_value, robot_traj_st_t, map_tuple, scene.dt, (scene.name, t, '/'.join([node.type.name, node.id])), node.type)
+    return (first_history_index, x_t, y_t, x_st_t, y_st_t, neighbors_data_st_t, neighbors_gt_st_t,
+            neighbors_type, robot_traj_st_t, map_tuple, scene.dt, (scene.name, t, '/'.join([node.type.name, node.id])), node.type)
     
 
 

@@ -1,0 +1,14 @@
+MODEL:
+  TYPE: ContinuousFlowChainOnestep_CIF
+
+DATA:
+  DATASET_NAME: "simline"
+  TRAJ:
+    PRED_STATE: 'state_p'
+    
+
+
+SOLVER:
+  USE_SCHEDULER: True
+  LR: 1e-5
+  

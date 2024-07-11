@@ -1,0 +1,14 @@
+MODEL:
+  TYPE: ContinuousFlowChain_CIF_separate_cond
+
+DATA:
+  DATASET_NAME: "simfork"
+  TRAJ:
+    PRED_STATE: 'state_v'
+  
+SOLVER:
+  USE_SCHEDULER: True
+  WEIGHT_DECAY: 0.0
+  LR: 1e-4
+  
+  

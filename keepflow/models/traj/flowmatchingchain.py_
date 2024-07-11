@@ -1,0 +1,143 @@
+from yacs.config import CfgNode
+from typing import Dict
+
+import torch
+import torch.nn as nn
+
+from torchcfm.conditional_flow_matching import ConditionalFlowMatcher
+
+from .flowchain import DiagonalGaussianConditionalDensity
+from .continuousflowchain import ContinuousFlowChainTraj, Score
+
+
+class FlowMatchingChainTraj(ContinuousFlowChainTraj):
+    def _build_flow(self, cfg: CfgNode):
+        ### dynamics model, dz/dt
+        model_dict = {
+            "FlowMatchingChain": Score,
+            "FlowMatchingChain_CIF": Score
+        }
+        
+        conditioning_length = \
+            self.hyperparams["enc_rnn_dim_history"] + \
+            self.hyperparams["enc_rnn_dim_edge"] * self.hyperparams["edge_encoding"] + \
+            self.hyperparams["enc_rnn_dim_future"] * self.hyperparams["incl_robot_node"]
+            
+        if "CIF" in cfg.MODEL.TYPE:
+            dim_latent = 10
+            self.conditional_density = DiagonalGaussianConditionalDensity(
+                cond_dim=conditioning_length,
+                out_dim=dim_latent)
+            conditioning_length += dim_latent
+        else:
+            self.conditional_density = None
+            
+        self.flow = nn.ModuleDict()
+        for node_type in self.env.NodeType:
+            self.flow[node_type] = model_dict[cfg.MODEL.TYPE](
+                dim_condition=conditioning_length,
+            )
+            
+        self.flow.conditional_density = self.conditional_density
+            
+        self.sigma = 0.01
+        self.FM = ConditionalFlowMatcher(sigma=self.sigma)
+    
+    def training_step(self, data_dict: Dict) -> Dict:
+        node = self.get_node_type(data_dict)
+        dist_args = self.get_dist_arg(data_dict, self.pred_len)
+        
+        base_pos = self._get_base_pos(data_dict)
+        gt = data_dict['gt']
+        batch_size, _, _ = gt.shape
+        
+        x0 = torch.cat([base_pos[:, None], gt[:, :-1]], dim=1).reshape(batch_size * self.pred_len, -1)
+        x1 = gt.reshape(batch_size * self.pred_len, -1)
+        
+        t, xt, ut = self.FM.sample_location_and_conditional_flow(x0, x1)
+        
+        t_offset = torch.arange(self.pred_len)[None, :]
+        t_offset = t_offset.tile([batch_size, 1]).reshape(-1)
+        t += t_offset.to(self.device)
+        
+        vt = self.flow[node](torch.cat([xt, t[..., None], dist_args], dim=-1))
+        loss = torch.mean((vt - ut) ** 2)
+        loss.backward()
+        self.optimizer.step()
+        
+        return {'loss': loss.mean().item()}
+    
+    
+    def predict(self, data_dict: Dict, return_prob: bool = True) -> Dict:
+        if return_prob:
+            return self._predict_CNF(data_dict)
+        else:
+            return self._predict_ODE(data_dict)
+        
+    def _predict_ODE(self, data_dict: Dict) -> Dict:
+        num_sample = 1
+        
+        node = self.get_node_type(data_dict)
+        dist_args = self.get_dist_arg(data_dict, num_sample)
+        
+        base_pos = self._get_base_pos(data_dict)
+        batch_size, dim = base_pos.shape
+        
+        gaussian = Normal(torch.zeros(dim).to(self.device), torch.ones(dim).to(self.device) * self.sigma * 2)
+        epsilon = gaussian.sample(sample_shape=[batch_size, num_sample])
+        base_sample = base_pos[:, None].tile([1, num_sample, 1]) + epsilon
+        base_sample = base_sample.reshape([batch_size * num_sample, -1])
+        
+        ode = ConditionalODE(self.flow[node])
+
+        _, traj = odeint(
+            lambda t, x: ode(t, x, dist_args),
+            base_sample,
+            torch.linspace(0, self.pred_len, self.pred_len+1, device=self.device),
+            atol=1e-4,
+            rtol=1e-4,
+            solver="dopri5"
+        )
+        
+        traj = traj.transpose(0, 1).reshape(batch_size, num_sample, self.pred_len+1, -1)
+        
+        data_dict[("pred", 0)] = traj[:, 0, 1:]
+        
+        return data_dict
+        
+    def _predict_CNF(self, data_dict: Dict) -> Dict:        
+        num_sample = 10000
+        
+        node = self.get_node_type(data_dict)
+        dist_args = self.get_dist_arg(data_dict, num_sample)
+        
+        base_pos = self._get_base_pos(data_dict)
+        batch_size, dim = base_pos.shape
+        
+        gaussian = Normal(torch.zeros(dim).to(self.device), torch.ones(dim).to(self.device) * self.sigma * 2)
+        epsilon = gaussian.sample(sample_shape=[batch_size, num_sample])
+        base_log_prob = torch.sum(gaussian.log_prob(epsilon), dim=-1)[..., None]
+        base_sample = base_pos[:, None].tile([1, num_sample, 1]) + epsilon 
+        base_log_prob_sample = torch.cat([base_log_prob, base_sample], dim=-1)
+        base_log_prob_sample = base_log_prob_sample.reshape([batch_size * num_sample, -1])
+        
+        cnf = ConditionalCNF(self.flow[node])
+
+        _, traj = odeint(
+            lambda t, x: cnf(t, x, dist_args),
+            base_log_prob_sample,
+            torch.linspace(0, self.pred_len, self.pred_len+1, device=self.device),
+            atol=1e-4,
+            rtol=1e-4,
+            solver="dopri5"
+        )
+        
+        traj = traj.transpose(0, 1).reshape(batch_size, num_sample, self.pred_len+1, -1)
+        
+        data_dict[("pred", 0)] = traj[:, 0, 1:, 1:]
+        data_dict[("prob", 0)] = traj[..., 1:, [1, 2, 0]]
+        
+        return data_dict
+    
+    
+

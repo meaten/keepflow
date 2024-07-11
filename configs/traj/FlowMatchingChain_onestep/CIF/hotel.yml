@@ -1,0 +1,15 @@
+MODEL:
+  TYPE: FlowMatchingChainOnestep_CIF
+
+DATA:
+  DATASET_NAME: "hotel"
+  TRAJ:
+    PRED_STATE: 'state_p'
+    ACCEPT_NAN: True
+
+SOLVER:
+  USE_SCHEDULER: True
+  WEIGHT_DECAY: 0.0
+  ITER: 1000
+  LR_MIN_RATIO: 1e-3
+  SAVE_EVERY: 50

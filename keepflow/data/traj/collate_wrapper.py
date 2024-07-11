@@ -1,8 +1,14 @@
+import torch
 import torch.nn.functional as F
 
 class CollateWrapper(object):
-    def __init__(self, cfg, collate_fn, scale) -> None:
+    def __init__(self, cfg, collate_fn, scale,
+                 standardize_data,
+                 standardize_derivatives) -> None:
         self.collate_fn = collate_fn
+        
+        self.standardize_data = standardize_data
+        self.standardize_derivatives = standardize_derivatives
         
         self.obs_len = cfg.DATA.OBSERVE_LENGTH
         self.pred_len = cfg.DATA.PREDICT_LENGTH
@@ -28,29 +34,30 @@ class CollateWrapper(object):
         
         index = [(s, t, f'{tp}_{a}') for s, t, tp, a in zip(batch.scene_ids, batch.scene_ts, batch.agent_type, batch.agent_name)]
         
-        curr_pos = batch.curr_agent_state[:, None, :2]
+        curr_state = batch.curr_agent_state
 
         obs = batch.agent_hist
-        obs[..., :2] -= curr_pos
         obs = obs[..., self.state_idx]
         
         gt = batch.agent_fut
-        gt[..., :2] -= curr_pos
         gt = gt[..., self.pred_state_idx]
 
-        curr_pos = curr_pos[:, None]
+        curr_state = curr_state[:, None]
+        standardize_offset = torch.zeros_like(curr_state)
+        if self.standardize_data:
+            standardize_offset[..., :2] = curr_state[..., :2]
+        if self.standardize_derivatives:
+            standardize_offset[..., 2:] = curr_state[..., 2:]
 
         neighbors = batch.neigh_hist
-        neighbors[..., :2] -= curr_pos
         neighbors = neighbors[..., self.state_idx]
         neighbors = F.pad(neighbors, (0, 0, self.obs_len - neighbors.shape[2], 0), 'constant', float('nan'))
         
         neighbors_gt = batch.neigh_fut
-        neighbors_gt[..., :2] -= curr_pos
         neighbors_gt = neighbors_gt[..., self.pred_state_idx]
         neighbors_gt = F.pad(neighbors_gt, (0, 0, 0, self.pred_len - neighbors_gt.shape[2]), 'constant', float('nan'))
         
-        curr_pos *= self.scale
+        standardize_offset *= self.scale
         obs *= self.scale
         gt *= self.scale
         neighbors *= self.scale
@@ -60,21 +67,15 @@ class CollateWrapper(object):
             "index": index,
             "obs": obs,
             "gt": gt,
-            # "obs_st": obs,
-            # "gt_st": gt,
-            # "neighbors_st": neighbors,
-            # "neighbors_gt_st": neighbors_gt,
             "neighbors": neighbors,
             "neighbors_gt": neighbors_gt,
-            # "neighbors_edge": neighbors_edge_value,
             'agent_type': batch.agent_type,
             'neighbor_type': batch.neigh_types,
-            'curr_state': batch.curr_agent_state,
+            'standardize_offset': standardize_offset,
             "robot_traj": batch.robot_fut,
             "map": batch.maps,
             "dt": batch.dt,
             "first_history_index": batch.agent_hist.shape[1] - batch.agent_hist_len,
-            # "this_node_type": batch.agent_type
         }
         
         return data_dict

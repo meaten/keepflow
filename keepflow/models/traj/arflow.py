@@ -138,7 +138,7 @@ class ARFlow(ModelTemplate):
             data_dict[('gt_traj_log_prob', 0)] = gt_traj_log_prob
         return data_dict
 
-    def update(self, data_dict: Dict) -> Dict:
+    def training_step(self, data_dict: Dict) -> Dict:
         inputs = torch.cat([data_dict['obs'], data_dict['gt']], dim=1).transpose(1, 0)
 
         enc_inputs = torch.nan_to_num(inputs[: self.obs_len, ...])

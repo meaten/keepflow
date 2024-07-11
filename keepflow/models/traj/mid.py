@@ -109,11 +109,7 @@ class MID(ModelTemplate):
         
         return data_dict
     
-    def predict_from_new_obs(self, data_dict, time_step: int):
-        # do nothing
-        return data_dict
-    
-    def update(self, data_dict):
+    def training_step(self, data_dict):
         batch = self.create_batch(data_dict)
         
         node_type = str(AgentType(data_dict['agent_type'][0].item())).lstrip('AgentType.')  # assume all agnet types are the same in this minibatch

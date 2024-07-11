@@ -170,7 +170,7 @@ class ActionCondPredRNN_v2(ModelTemplate):
         data_dict[("pred", 0)] = next_frames[-self.pred_len:]
         return data_dict
 
-    def update(self, data_dict):
+    def training_step(self, data_dict):
         self.optimizer.zero_grad()
         
         batch_size = data_dict['obs'].shape[1]

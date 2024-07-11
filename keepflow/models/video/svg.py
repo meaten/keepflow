@@ -68,7 +68,7 @@ class SVG(ModelTemplate):
 
         self.last_frame_skip = False
 
-    def update(self, data_dict):
+    def training_step(self, data_dict):
         self.frame_predictor.zero_grad()
         self.posterior.zero_grad()
         self.prior.zero_grad()

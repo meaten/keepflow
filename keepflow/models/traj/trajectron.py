@@ -183,13 +183,9 @@ class Trajectron(ModelTemplate):
             y_dist = model.dynamic.integrate_distribution(y_dist)
             data_dict[("prob", 0)] = y_dist
             y_dist.log_prob(torch.rand_like(predictions).tile(1, 10000, 1, 1))  # calculate the probability for the fair comparison on inference cost
-        return data_dict           
-        
-    def predict_from_new_obs(self, data_dict, time_step: int):
-        # do nothing
         return data_dict
     
-    def update(self, data_dict):
+    def training_step(self, data_dict):
         batch = self.create_batch(data_dict)
         
         node_type = str(AgentType(data_dict['agent_type'][0].item())).lstrip('AgentType.')  # assume all agnet types are the same in this minibatch

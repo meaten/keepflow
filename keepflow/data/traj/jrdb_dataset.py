@@ -19,7 +19,7 @@ def jrdb_collate(batch):
     (index, obs, gt,
      neighbors, neighbors_gt,
      agent_type, neighbor_type,
-     curr_state, robot_fut, map, dt, 
+     standardize_offset, robot_fut, map, dt, 
      first_history_index, this_node_type) = zip(*batch)
     
     obs = np.array(obs)
@@ -44,7 +44,7 @@ def jrdb_collate(batch):
         "neighbors_gt": torch.Tensor(neighbors_gt_),
         'agent_type': agent_type,
         "neighbor_type": torch.Tensor(neighbor_type),
-        "curr_state": torch.Tensor(np.array(curr_state)),
+        "standardize_offset": torch.zeros_like(np.array(standardize_offset)),
         "robot_traj": None,
         "map": None,
         "dt": torch.Tensor(np.array(dt)),
@@ -78,7 +78,7 @@ class JRDB_Dataset(Dataset):
                 self.neighbors_gt = npz['neighbors_gt']
                 self.agent_type = npz['agent_type']
                 self.neighbor_type = npz['neighbor_type']
-                self.curr_state = npz['curr_state']
+                self.standardize_offset = npz['standardize_offset']
                 self.map = npz['map']
                 self.robot_fut = npz['robot_fut']
                 self.dt = npz['dt']
@@ -94,7 +94,7 @@ class JRDB_Dataset(Dataset):
             # data = Parallel(n_jobs=4)(delayed(paths_to_item)(scene, dt, cfg.DATA.TRAJ.ACCEPT_NAN) for scene in tqdm(scenes))
             data = [d for d in data if not len(d) == 0]
             idx, obs, gt, neighbors, neighbors_gt, \
-                agent_type, neighbor_type, curr_state, \
+                agent_type, neighbor_type, standardize_offset, \
                     dt, first_history_index = map(list, zip(*data))
             neighbors = np.array(neighbors, dtype=object)
             neighbors_gt = np.array(neighbors_gt, dtype=object)
@@ -108,7 +108,7 @@ class JRDB_Dataset(Dataset):
             self.neighbors_gt = neighbors_gt
             self.agent_type = np.array(agent_type)
             self.neighbor_type = neighbor_type
-            self.curr_state = np.array(curr_state)
+            self.standardize_offset = np.array(standardize_offset)
             self.map = [None] * len(self.idx)
             self.robot_fut = [None] * len(self.idx)
             self.dt = np.array(dt)
@@ -124,7 +124,7 @@ class JRDB_Dataset(Dataset):
                      neighbors_gt=self.neighbors_gt,
                      agent_type=self.agent_type,
                      neighbor_type=self.neighbor_type,
-                     curr_state=self.curr_state,
+                     standardize_offset=self.standardize_offset,
                      map=self.map,
                      robot_fut=self.robot_fut,
                      dt=self.dt,
@@ -145,7 +145,7 @@ class JRDB_Dataset(Dataset):
         return (self.idx[idx], obs, gt, \
             neighbors, neighbors_gt, \
             self.agent_type[idx], self.neighbor_type[idx],\
-            self.curr_state[idx], self.map[idx], \
+            self.standardize_offset[idx], self.map[idx], \
             self.robot_fut[idx], self.dt[idx], \
             self.first_history_index[idx], self.this_node_type[idx])
      
@@ -158,10 +158,10 @@ def paths_to_item(scene, dt, accept_nan):
     if len(paths) == 0:
         return []
     pos, vel, acc, nan_flag = calc_pos_vel_acc(paths, dt)
-    
-    curr_state = np.copy(pos[7, 0])
-    pos -= curr_state
+
     pva = np.concatenate([pos, vel, acc], axis=-1)
+    standardize_offset = np.copy(pva[7, 0])
+    pva -= standardize_offset
     obs = pva[:8].transpose(1, 0, 2)
     gt = pva[8:-1].transpose(1, 0, 2)
 
@@ -169,14 +169,13 @@ def paths_to_item(scene, dt, accept_nan):
     gt_ = gt[0]
     neighbors_ = obs[1:]
     neighbors_gt_ = gt[1:]
-    curr_state = curr_state
     first_history_index = np.argmax(nan_flag[:, 0])
 
     idx = (filename, scene_id, ped_id)
     agent_type = 2
     neighbor_type = [2] * len(neighbors_)
     
-    return idx, obs_, gt_, neighbors_, neighbors_gt_, agent_type, neighbor_type, curr_state, dt, first_history_index
+    return idx, obs_, gt_, neighbors_, neighbors_gt_, agent_type, neighbor_type, standardize_offset, dt, first_history_index
 
 def fetch(state, pva):
     if state == 'state_p':

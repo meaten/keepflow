@@ -1,12 +1,12 @@
 yacs
 tqdm
 easydict
-numpy==1.20.3
+numpy
 scipy
-torch
-optuna
+optuna==3.1.0
 POT
 pandas<2.0.0
+timm
 
 dill
 ncls
@@ -15,3 +15,7 @@ joblib
 
 matplotlib
 seaborn
+
+trajdata
+torchcfm
+torchdyn

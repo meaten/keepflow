@@ -1,0 +1,13 @@
+MODEL:
+  TYPE: ContinuousFlowChainOnestep_CIF
+
+DATA:
+  DATASET_NAME: "sdd"
+  TRAJ:
+    PRED_STATE: 'state_p'
+    ACCEPT_NAN: True
+
+
+SOLVER:
+  USE_SCHEDULER: True
+  LR: 1e-5

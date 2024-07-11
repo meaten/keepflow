@@ -63,10 +63,6 @@ class socialLSTM(ModelTemplate):
         pred_traj_fake_rel = pred_traj_fake_rel.permute(1, 0, 2)
         data_dict[("pred", 0)] = pred_traj_fake_rel[seq_start_end_slstm[:, 0]]
         return data_dict
-    
-    def predict_from_new_obs(self, data_dict: Dict, time_step: int) -> Dict:
-        # do nothing
-        return data_dict
 
     def data_dict_to_slstm(self, data_dict):
         bs, t, _ = data_dict["obs"].shape
@@ -89,7 +85,7 @@ class socialLSTM(ModelTemplate):
         
         return obs_slstm, obs_slstm_rel, seq_start_end_slstm
 
-    def update(self, data_dict: Dict) -> Dict:
+    def training_step(self, data_dict: Dict) -> Dict:
         g_loss = 0
         
         data_dict = self.predict(data_dict)

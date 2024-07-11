@@ -4,6 +4,10 @@ from yacs.config import CfgNode
 import shutil
 import optuna
 
+import random
+import numpy as np
+import torch
+
 
 def load_config(args: argparse.Namespace, while_tuning: bool=False) -> CfgNode:
     from .default_params import _C as cfg
@@ -22,7 +26,12 @@ def load_config(args: argparse.Namespace, while_tuning: bool=False) -> CfgNode:
     if cfg_.LOAD_TUNED and not while_tuning:
         cfg_ = load_tuned_params(args, cfg_)
         
-    # only to(device) cannot force trajdata on the specified device
+    # for reproducibility
+    random.seed(cfg.SEED)
+    np.random.seed(cfg.SEED)
+    torch.manual_seed(cfg.SEED)
+        
+    # just performing 'to(device)' cannot force trajdata on the specified device
     if args.device == "cpu":
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
         cfg_.DEVICE = args.device
@@ -48,7 +57,7 @@ def load_tuned_params(args: argparse.Namespace, cfg: CfgNode) -> CfgNode:
     print("load hyperparameters from optuna database")
     study = optuna.load_study(storage=study_path, study_name="my_opt")
     trial_dict = study.best_trial.params
-    
+
     for key in list(trial_dict.keys()):
         if type(trial_dict[key]) == str:
             exec(f"cfg.{key} = '{trial_dict[key]}'")

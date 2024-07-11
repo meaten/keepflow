@@ -4,7 +4,6 @@ from yacs.config import CfgNode
 import numpy as np
 import torch
 from copy import deepcopy
-from tqdm import tqdm
 
 from keepflow.utils import load_config, Timer, kde
 from keepflow.data import build_dataloader
@@ -12,8 +11,15 @@ from keepflow.models import build_model
 from keepflow.metrics import build_metrics
 from keepflow.visualization import build_visualizer
 
-from train import evaluate_model, aggregate
+from train import evaluate_model, aggregate, dict_to_device, copy_dict
 
+
+def main() -> None:
+    args = parse_args()
+    cfg = load_config(args)
+
+    test(cfg, args.visualize)
+    
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="pytorch testing code for task-agnostic time-series prediction")
@@ -33,9 +39,9 @@ def test(cfg: CfgNode, flag_visualize: bool=False) -> None:
         model.load()
     except FileNotFoundError:
         print("no model saved")
-        
-    result_metrics = {}
     
+    result_metrics = {}
+
     if flag_visualize:
         result_metrics.update(visualize(cfg, model))
     result_metrics.update(evaluate_model(cfg, model, data_loader))
@@ -53,26 +59,23 @@ def visualize(cfg, model: torch.nn.Module):
     timer = Timer(cfg.DEVICE)
     
     update_timesteps = [1, 2, 3, 4, 5, 6]
-    update_timesteps = [1]
+    update_timesteps = []
     
     result_metrics = {}
     
     run_times = {0: []}
     run_times.update({t: [] for t in update_timesteps})
-
+    
     visualizer = build_visualizer(cfg)
     with torch.no_grad():
         result_list = []
         print("timing the computation, evaluating probability map, and visualizing... ")
         data_loader = build_dataloader(cfg, rand=False, split = "test", batch_size=1)
-        n_vis = 100
+        n_vis = 1000
         prev_idx = None
         count = 0
         for data_dict in data_loader:
-            data_dict = {k: data_dict[k].to(cfg.DEVICE) 
-                        if isinstance(data_dict[k], torch.Tensor)
-                        else data_dict[k]
-                        for k in data_dict}
+            data_dict = dict_to_device(data_dict, cfg.DEVICE)
             
             if data_dict["index"][0][2] == prev_idx:
                 continue
@@ -81,32 +84,29 @@ def visualize(cfg, model: torch.nn.Module):
                 count += 1
                 print(f"visualize {count} / {n_vis}")
 
-            result_dict = model.predict(deepcopy(data_dict), return_prob=True)  # warm-up
+            result_dict = model.predict(copy_dict(data_dict), return_prob=True)  # warm-up
             timer.start()
-            result_dict = model.predict(deepcopy(data_dict), return_prob=True)
+            result_dict = model.predict(copy_dict(data_dict), return_prob=True)
             timer.end()
             curr_run_time = timer.elapsed_time()
             run_times[0].append(curr_run_time)
-                
+            
             for t in update_timesteps:
                 timer.start()
-                result_dict = model.predict_from_new_obs(result_dict, t)
+                result_dict = model.update_from_new_obs(result_dict, t)
                 timer.end()
                 curr_run_time = timer.elapsed_time()
                 run_times[t].append(curr_run_time)
             
-            dict_list = [deepcopy(result_dict)]  # need to be list of dicts
+            dict_list = [copy_dict(result_dict)]  # need to be list of dicts
             dict_list = metrics.denormalize(dict_list)  # denormalize the output
             if cfg.TEST.KDE:
                 timer.start()
                 dict_list = kde(dict_list)
                 timer.end()
                 run_times[0][-1] += timer.elapsed_time()
-            timer.start()
-            # dict_list = visualizer.prob_on_grid(dict_list)
-            timer.end()
-            run_times[0][-1] += timer.elapsed_time()
-            result_list.append(metrics(deepcopy(dict_list)))
+            dict_list = visualizer.prob_on_grid(dict_list)
+            result_list.append(metrics(dict_list))
             
             if visualize:
                 visualizer(dict_list)
@@ -116,7 +116,8 @@ def visualize(cfg, model: torch.nn.Module):
         result_metrics.update(aggregate(result_list))
         
     print(f"execution time: {np.mean(run_times[0]):.2f} " + u"\u00B1" + f"{np.std(run_times[0]):.2f} [ms]")
-    print(f"execution time: {np.mean(run_times[1]):.2f} " + u"\u00B1" + f"{np.std(run_times[1]):.2f} [ms]")
+    if len(update_timesteps) != 0:
+        print(f"execution time: {np.mean(run_times[1]):.2f} " + u"\u00B1" + f"{np.std(run_times[1]):.2f} [ms]")
     result_metrics.update({"execution time": np.mean(run_times[0]), "time std": np.std(run_times[0])})
     
     # from visualization.TP_visualizer import plot2d_trajectories_samples
@@ -136,13 +137,6 @@ def visualize(cfg, model: torch.nn.Module):
     model.train()
     
     return result_metrics
-
-
-def main() -> None:
-    args = parse_args()
-    cfg = load_config(args)
-
-    test(cfg, args.visualize)
 
 if __name__ == "__main__":
     main()
