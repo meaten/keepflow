@@ -11,5 +11,5 @@ DATA:
 SOLVER:
   USE_SCHEDULER: True
   WEIGHT_DECAY: 0.0
-  ITER: 500
+  
   

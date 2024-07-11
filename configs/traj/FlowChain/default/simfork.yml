@@ -3,6 +3,9 @@ MODEL:
 
 DATA:
   DATASET_NAME: "simfork"
+  TRAJ:
+    PRED_STATE: 'state_v'
 
 SOLVER:
+  
   USE_SCHEDULER: True

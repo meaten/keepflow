@@ -3,11 +3,11 @@ MODEL:
 
 DATA:
   DATASET_NAME: "simfork"
-  TP:
+  TRAJ:
     PRED_STATE: 'state_v'
     
 SOLVER:
   USE_SCHEDULER: True
   WEIGHT_DECAY: 0.0
-  ITER: 500
+  ITER: 1000
   

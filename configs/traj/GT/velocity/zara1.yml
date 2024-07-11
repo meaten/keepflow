@@ -4,5 +4,4 @@ MODEL:
 DATA:
   DATASET_NAME: "zara1"
   TRAJ:
-    STATE: state_v
     PRED_STATE: state_v

@@ -1,8 +1,0 @@
-MODEL:
-  TYPE: FlowChain_VFlow
-
-DATA:
-  DATASET_NAME: "simfork"
-
-SOLVER:
-  USE_SCHEDULER: True

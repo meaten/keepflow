@@ -4,5 +4,4 @@ MODEL:
 DATA:
   DATASET_NAME: "eth"
   TRAJ:
-    STATE: state_v
     PRED_STATE: state_v
