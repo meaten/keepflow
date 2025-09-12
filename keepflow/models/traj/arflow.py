@@ -236,14 +236,14 @@ class FlowSequential(nn.Sequential):
         sum_log_abs_det_jacobians = 0
         for module in self:
             x, log_abs_det_jacobian = module(x, y)
-            sum_log_abs_det_jacobians += log_abs_det_jacobian
+            sum_log_abs_det_jacobians -= log_abs_det_jacobian
         return x, torch.sum(sum_log_abs_det_jacobians, dim=-1)
 
     def inverse(self, u, y):
         sum_log_abs_det_jacobians = 0
         for module in reversed(self):
             u, log_abs_det_jacobian = module.inverse(u, y)
-            sum_log_abs_det_jacobians += log_abs_det_jacobian
+            sum_log_abs_det_jacobians -= log_abs_det_jacobian
         return u, torch.sum(sum_log_abs_det_jacobians, dim=-1)
 
 
@@ -338,44 +338,26 @@ class LinearMaskedCoupling(nn.Module):
     def forward(self, x, y=None):
         # apply mask
         mx = x * self.mask
-        
+
         # run through model
         s = self.s_net(mx if y is None else torch.cat([y, mx], dim=-1))
-        t = self.t_net(mx if y is None else torch.cat([y, mx], dim=-1)) * (
-            1 - self.mask
-        )
-        
-        # cf RealNVP eq 8 where u corresponds to x (here we're modeling u)
-        log_s = torch.tanh(s) * (1 - self.mask)
-        u = x * torch.exp(log_s) + t
-        # u = (x - t) * torch.exp(log_s)
-        # u = mx + (1 - self.mask) * (x - t) * torch.exp(-s)
+        t = self.t_net(mx if y is None else torch.cat([y, mx], dim=-1))
+        u = mx + (1 - self.mask) * (x - t) * torch.exp(-s)  # cf RealNVP eq 8 where u corresponds to x (here we're modeling u)
 
-        # log det du/dx; cf RealNVP 8 and 6; note, sum over input_size done at model log_prob
-        # log_abs_det_jacobian = -(1 - self.mask) * s
-        # log_abs_det_jacobian = -log_s #.sum(-1, keepdim=True)
-        log_abs_det_jacobian = log_s
+        log_abs_det_jacobian = - (1 - self.mask) * s  # log det du/dx; cf RealNVP 8 and 6; note, sum over input_size done at model log_prob
 
         return u, log_abs_det_jacobian
 
     def inverse(self, u, y=None):
         # apply mask
         mu = u * self.mask
-
+        
         # run through model
         s = self.s_net(mu if y is None else torch.cat([y, mu], dim=-1))
-        t = self.t_net(mu if y is None else torch.cat([y, mu], dim=-1)) * (
-            1 - self.mask
-        )
-        
-        log_s = torch.tanh(s) * (1 - self.mask)
-        x = (u - t) * torch.exp(-log_s)
-        # x = u * torch.exp(log_s) + t
-        # x = mu + (1 - self.mask) * (u * s.exp() + t)  # cf RealNVP eq 7
+        t = self.t_net(mu if y is None else torch.cat([y, mu], dim=-1))
+        x = mu + (1 - self.mask) * (u * s.exp() + t)  # cf RealNVP eq 7
 
-        # log_abs_det_jacobian = (1 - self.mask) * s  # log det dx/du
-        # log_abs_det_jacobian = log_s #.sum(-1, keepdim=True)
-        log_abs_det_jacobian = -log_s
+        log_abs_det_jacobian = (1 - self.mask) * s  # log det dx/du
 
         return x, log_abs_det_jacobian
 

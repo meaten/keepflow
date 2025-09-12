@@ -7,15 +7,13 @@ import numpy as np
 
 import torch
 import torch.nn as nn
-import torch.optim as optim
-from torch.distributions import Normal
+import torch.distributions as D
 from trajdata.data_structures import AgentType
 
+from keepflow.data.traj import EmptyEnv, get_hypers
 from keepflow.models import ModelTemplate
-from keepflow.utils import EmptyEnv
 
 from .mid import (
-    get_traj_hypers,
     ModelRegistrar,
     Trajectron
 )
@@ -32,34 +30,40 @@ class FlowChainTraj(ModelTemplate):
     def __init__(self, cfg: CfgNode) -> None:
         super().__init__(cfg)
         
-        self._build_encoder(cfg)
-        self._build_flow(cfg)
+        self.pred_state = cfg.DATA.TRAJ.PRED_STATE
+        
+        dim_encoder = self._build_encoder(cfg)
+        self._build_flow(cfg, dim_encoder)
         self._build_optimizer(cfg)
         
         self.ldjs_tmp = None
         self.base_prob_normalizer_tmp = None
         
-    def _build_encoder(self, cfg: CfgNode) -> None:
-        ### Trajectron Encoder
-        self.pred_state = cfg.DATA.TRAJ.PRED_STATE
+    def _build_encoder(self, cfg: CfgNode) -> int:
+        env = EmptyEnv(cfg)
+        self.env = env
         
-        with open("extern/traj/MID/configs/baseline.yaml") as f:
-            config = yaml.safe_load(f)
-        self.config = EasyDict(config)
-        self.hyperparams = get_traj_hypers()
-        self.hyperparams['enc_rnn_dim_edge'] = self.config.encoder_dim//2
-        self.hyperparams['enc_rnn_dim_edge_influence'] = self.config.encoder_dim//2
-        self.hyperparams['enc_rnn_dim_history'] = self.config.encoder_dim//2
-        self.hyperparams['enc_rnn_dim_future'] = self.config.encoder_dim//2
+        ### Trajectron Encoder
+        self.hyperparams = get_hypers(cfg)
+        self.hyperparams['use_map_encoding'] = cfg.DATA.TRAJ.USE_MAP
+        self.hyperparams['state'] = {type: self.hyperparams[cfg.DATA.TRAJ.STATE] for type in env.NodeType}
+        self.hyperparams['pred_state'] = {type: self.hyperparams[cfg.DATA.TRAJ.PRED_STATE] for type in env.PredNodeType}
+        
+        dim_encoder = \
+            self.hyperparams["enc_rnn_dim_history"] + \
+            self.hyperparams["enc_rnn_dim_edge"] * self.hyperparams["edge_encoding"] + \
+            self.hyperparams["enc_rnn_dim_future"] * self.hyperparams["incl_robot_node"] + \
+            self.hyperparams["map_encoder"][env.PredNodeType[0]]["output_size"] * cfg.DATA.TRAJ.USE_MAP
                     
         self.registrar = ModelRegistrar(self.save_dir, self.device)
         
         self.encoder = Trajectron(self.registrar, self.hyperparams, self.device)
-
-        env = EmptyEnv(cfg)
-        self.env = env
+        self.cond_shaper = nn.Linear(dim_encoder, cfg.MODEL.FLOW.COND_SIZE)
+        
         self.encoder.set_environment(env)
         self.encoder.set_annealing_params()
+        
+        return dim_encoder
 
     def _build_model_dict(self, cfg: CfgNode) -> Dict:
         model_dict = {
@@ -73,20 +77,13 @@ class FlowChainTraj(ModelTemplate):
         
         return model_dict
 
-    def _build_flow(self, cfg: CfgNode):
+    def _build_flow(self, cfg: CfgNode, dim_encoder: int) -> None:
         ### FlowChain Model
         model_dict = self._build_model_dict(cfg)
         
         n_blocks = cfg.MODEL.FLOW.N_BLOCKS
         n_hidden = cfg.MODEL.FLOW.N_HIDDEN
         hidden_size = cfg.MODEL.FLOW.HIDDEN_SIZE
-
-        dim_encoder = \
-            self.hyperparams["enc_rnn_dim_history"] + \
-            self.hyperparams["enc_rnn_dim_edge"] * self.hyperparams["edge_encoding"] + \
-            self.hyperparams["enc_rnn_dim_future"] * self.hyperparams["incl_robot_node"]
-            
-        self.cond_shaper = nn.Linear(dim_encoder, cfg.MODEL.FLOW.COND_SIZE)
         
         self.flow = nn.ModuleDict()
         for node_type in self.env.NodeType:
@@ -106,21 +103,17 @@ class FlowChainTraj(ModelTemplate):
         self.dequantize = cfg.SOLVER.DEQUANTIZE
 
         decay_parameters = [
-            # n for n, p in self.flow.named_parameters() if 'bias' not in n]
-            n for n, p in self.named_parameters() if 'bias' not in n]
+            n for n, p in self.flow.named_parameters() if 'bias' not in n]
         
         optimizer_grouped_parameters = [
-            {
-                "params": [p for n, p in self.named_parameters() if n in decay_parameters],
-                "weight_decay": cfg.SOLVER.WEIGHT_DECAY,
-            },
-            {
-                "params": [p for n, p in self.named_parameters() if n not in decay_parameters],
-                "weight_decay": 0.0,
-            },
+            {"params": self.registrar.get_all_but_name_match('map_encoder').parameters(), "lr": 0.001},
+            {'params': self.registrar.get_name_match('map_encoder').parameters(), 'lr':0.0001},
+            {"params": [p for n, p in self.flow.named_parameters() if n in decay_parameters], "weight_decay": cfg.SOLVER.WEIGHT_DECAY,},
+            {"params": [p for n, p in self.flow.named_parameters() if n not in decay_parameters], "weight_decay": 0.0,},
+            {"params": [p for n, p in self.cond_shaper.named_parameters()], "weight_decay": 0.0,},
         ]
         
-        self.optimizer = optim.AdamW(
+        self.optimizer = torch.optim.AdamW(
             optimizer_grouped_parameters, cfg.SOLVER.LR)
         self.optimizers = [self.optimizer]
 
@@ -189,7 +182,7 @@ class FlowChainTraj(ModelTemplate):
         data_dict[("prob", 0)] = torch.cat(
             [sampled_seq, log_prob[..., None]], dim=-1)
 
-        data_dict[("pred", 0)] = sampled_seq[:, -1]
+        data_dict[("pred", 0)] = sampled_seq[:, :20]
             
         return data_dict
 
@@ -197,19 +190,30 @@ class FlowChainTraj(ModelTemplate):
         node = self.get_node_type(data_dict)
         cond = self._encode(data_dict, node)
         
-        sample_num = 1
+        sample_num = 1000
 
         base_pos = self._get_base_pos(data_dict)
         sampled_seq, log_prob, seq_ldjs, base_log_prob = self.flow[node].sample_with_log_prob(
             base_pos[:, None].expand(-1, sample_num, -1),
             cond=cond[:, None].expand(-1, sample_num, -1))
         
-        data_dict[("pred", 0)] = sampled_seq[:, -1]
+        data_dict[("pred", 0)] = FPC(sampled_seq, 20)
+        # data_dict[("pred", 0)] = sampled_seq[:, :20]
+        mask = self.calculate_mask(data_dict['obs'][:, :, :2])
+        data_dict[("pred", 0)][~mask, 0] = 0.0
         if torch.sum(torch.isnan(data_dict[('pred', 0)])):
             data_dict[("pred", 0)] = torch.where(torch.isnan(data_dict[("pred", 0)]),
-                                                    data_dict['obs'][:, 0, None, 2:4].expand(data_dict[("pred", 0)].size()),
+                                                    base_pos[:, None, None].expand(data_dict[("pred", 0)].size()),
                                                     data_dict[('pred', 0)])
         return data_dict
+    
+    def calculate_mask(self, obs_traj):
+        self.static_dist = 0.1
+        if obs_traj.size(1) <= 2:
+            mask = (obs_traj[:, -1] - obs_traj[:, -2]).div(1).norm(p=2, dim=-1) > self.static_dist
+        else:
+            mask = (obs_traj[:, -1] - obs_traj[:, -3]).div(2).norm(p=2, dim=-1) > self.static_dist
+        return mask
 
     def update_from_new_obs(self, data_dict: Dict, time_step: int) -> Dict:
         node = self.get_node_type(data_dict)
@@ -218,21 +222,21 @@ class FlowChainTraj(ModelTemplate):
         
         data_dict[("prob", time_step)] = data_dict[(
             "prob", 0)][:, :, time_step:].clone()
-            
+        
         base_log_prob = self.flow[node].base_dist(
             data_dict["gt"][:, time_step-1], step=time_step).log_prob(data_dict[("prob", 0)][:, :, time_step-1, :2])
         base_log_prob = torch.sum(base_log_prob, dim=-1)
         base_prob = base_log_prob.exp()
         base_log_prob = (base_prob / base_prob.sum(dim=1) * self.base_prob_normalizer_tmp).log()
         log_prob = base_log_prob[:, :, None] + \
-            torch.cumsum(self.ldjs_tmp[:, :, time_step:], dim=0) / torch.cumsum(torch.ones_like(self.ldjs_tmp[:, :, time_step:]), dim=0) 
+            torch.cumsum(self.ldjs_tmp[:, :, time_step:], dim=0)
+            # torch.cumsum(self.ldjs_tmp[:, :, time_step:], dim=0) / torch.cumsum(torch.ones_like(self.ldjs_tmp[:, :, time_step:]), dim=0) 
         data_dict[("prob", time_step)][..., -1] = log_prob
-
         index_ML = data_dict[("prob", time_step)][:,:, -1, -1].argmax(dim=1)[:, None, None]
         index_ML = index_ML.expand(
             data_dict["gt"][:, time_step:].size()).unsqueeze(1)
         data_dict[("pred", time_step)] = torch.gather(data_dict[(
-            "prob", time_step)][..., :2], 1, index_ML).squeeze(1)  # sample maximum likelihood
+            "prob", time_step)][..., :2], 1, index_ML)
 
         return data_dict
     
@@ -248,7 +252,7 @@ class FlowChainTraj(ModelTemplate):
         
         mask = ~torch.isnan(gt)[..., 0]
         loss = -self.flow[node].log_prob(base_pos, gt.nan_to_num(), cond)
-        loss *= mask
+        loss *= mask    
         loss = loss.mean()
         
         self.optimizer.zero_grad()
@@ -285,7 +289,7 @@ class FlowChainTraj(ModelTemplate):
         if path is None:
             path = self.model_path
         
-        ckpt = torch.load(path, map_location=self.device)
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.registrar.load_models(ckpt['encoder'])
         
         # craete new Trajectron with loaded weights
@@ -328,7 +332,7 @@ class FlowChain(nn.Module):
                        n_hidden, cond_size, **kwargs)
 
     def base_dist(self, base_pos, step=0):
-        return Normal(base_pos, self.logvar[step].exp())
+        return D.Normal(base_pos, self.logvar[None, step].exp())
 
     def build_net(self, n_blocks, input_size, hidden_size, n_hidden, cond_size, **kwargs):
         flow_key = kwargs['flow_architecture']
@@ -354,7 +358,7 @@ class FlowChain(nn.Module):
         seq_log_det_jacobians = torch.stack(seq_log_det_jacobians, dim=2)
         seq_log_det_jacobians_cumsum = torch.cumsum(
             seq_log_det_jacobians, dim=2)
-        seq_log_det_jacobians_cumsum /= torch.cumsum(torch.ones_like(seq_log_det_jacobians_cumsum), dim=2)
+        # seq_log_det_jacobians_cumsum /= torch.cumsum(torch.ones_like(seq_log_det_jacobians_cumsum), dim=2)
         return seq, seq_log_det_jacobians_cumsum, seq_log_det_jacobians
 
     def log_prob(self, base_pos, seq, cond):
@@ -364,7 +368,7 @@ class FlowChain(nn.Module):
         seq_prev, seq_ldjs = self.forward_separate(seq, cond)
         base_pos = torch.cat([base_pos[:, None], seq[:, :-1]], dim=1)
         base_log_prob = self.base_dist(base_pos, step=list(range(base_pos.shape[1]))).log_prob(seq_prev)
-        return base_log_prob.sum(dim=-1) + seq_ldjs
+        return base_log_prob.sum(dim=-1) - seq_ldjs
 
     def sample(self, base_pos, cond):
         base_pos_sample = self.base_dist(base_pos).sample()
@@ -420,7 +424,7 @@ class FlowChain_separate(FlowChain):
         seq_log_det_jacobians = torch.stack(seq_log_det_jacobians, dim=2)
         seq_log_det_jacobians_cumsum = torch.cumsum(
             seq_log_det_jacobians, dim=2)
-        seq_log_det_jacobians_cumsum /= torch.cumsum(torch.ones_like(seq_log_det_jacobians_cumsum), dim=2)
+        # seq_log_det_jacobians_cumsum /= torch.cumsum(torch.ones_like(seq_log_det_jacobians_cumsum), dim=2)
         return seq, seq_log_det_jacobians_cumsum, seq_log_det_jacobians
 
 
@@ -545,7 +549,48 @@ class DiagonalGaussianConditionalDensity(nn.Module):
 
     def _means_and_log_stddevs(self, cond_inputs):
         return self.shift_net(cond_inputs), self.log_scale_net(cond_inputs)
+    
+    
+class DiagonalGaussianConditionalMixture(nn.Module):
+    def __init__(self,
+                 cond_dim,
+                 out_dim,
+                 n_components=2) -> None:
+        super().__init__()
+        self.shift_net = get_mlp(
+            cond_dim, [out_dim] * 2, out_dim * n_components, nn.ReLU)
 
+        self.log_scale_net = get_mlp(
+            cond_dim, [out_dim] * 2, out_dim * n_components, nn.ReLU)
+
+        self.logits_net = get_mlp(
+            cond_dim, [out_dim] * 2, n_components, nn.ReLU)
+
+        self.n_components = n_components
+        self.out_dim = out_dim
+    def log_prob(self, u, cond_inputs):
+        dist =  self._create_mixture(cond_inputs)
+        return dist.log_prob(u)
+    
+    def sample(self, cond_inputs):
+        # there is no rsample method in MixtureSameFamily
+        dist = self._create_mixture(cond_inputs)
+        u = dist.sample()
+        return u, dist.log_prob(u)
+    
+    def _means_and_log_stddevs(self, cond_inputs):
+        shape = cond_inputs.shape
+        shape = shape[:-1] + (self.n_components, self.out_dim)
+        return self.shift_net(cond_inputs).reshape(shape), \
+                self.log_scale_net(cond_inputs).reshape(shape), \
+                self.logits_net(cond_inputs)
+                
+    def _create_mixture(self, cond_inputs):
+        means, log_stddevs, logits = self._means_and_log_stddevs(cond_inputs)
+        mix = D.Categorical(logits=logits + 1e-4)
+        comp = D.Independent(D.Normal(means, torch.exp(log_stddevs) + 1e-4), 1)
+        return D.MixtureSameFamily(mix, comp)
+    
 
 def diagonal_gaussian_log_prob(u, means, log_stddevs):
     assert means.shape == log_stddevs.shape == u.shape
@@ -594,21 +639,34 @@ class CIF_step(nn.Module):
     def __init__(self,
                  bijection,
                  input_size,
-                 cond_size) -> None:
+                 cond_size,
+                 mixture_r_u=False,
+                 mixture_q_u=False) -> None:
         super().__init__()
         self.bijection = bijection
         self.cond_size = cond_size
-        self.r_u_given_x = DiagonalGaussianConditionalDensity(
-            input_size + cond_size, cond_size)
-        self.q_u_given_z = DiagonalGaussianConditionalDensity(
-            input_size + cond_size, cond_size)
 
+        # There is no rsample method in MixtureSameFamily
+        if mixture_r_u:
+            self.r_u_given_x = DiagonalGaussianConditionalMixture(
+                input_size + cond_size, cond_size)
+        else:
+            self.r_u_given_x = DiagonalGaussianConditionalDensity(
+                input_size + cond_size, cond_size)
+
+        if mixture_q_u:
+            self.q_u_given_z = DiagonalGaussianConditionalMixture(
+                input_size + cond_size, cond_size)
+        else:
+            self.q_u_given_z = DiagonalGaussianConditionalDensity(
+            input_size + cond_size, cond_size)
+            
     def forward(self, x, y):
         u, log_r_u = self.r_u_given_x.sample(torch.cat([x, y], dim=-1))
         z, log_det_jac = self.bijection.forward(x, u)
         log_q_u = self.q_u_given_z.log_prob(u, torch.cat([z, y], dim=-1))
 
-        return z, log_det_jac + log_q_u - log_r_u
+        return z, log_det_jac - log_q_u + log_r_u
 
     def inverse(self, z, y):
         u, log_q_u = self.q_u_given_z.sample(torch.cat([z, y], dim=-1))
@@ -656,3 +714,81 @@ class FlowChain_CIF_separate_cond(FlowChain_separate_cond):
                                            input_size,
                                            cond_size + i * input_size)
                                   for i in range(self.pred_len)])
+
+
+def FPC(y, n_samples):
+    # y: B x S x L x 2
+    final_pos = y[...,-1,:2]
+    centers = KMeans(final_pos, k=n_samples, n_iters=10).train_pts
+    dist = torch.norm(centers[:,:, None, :2] - final_pos[:, None, :, :2], dim=-1)
+    chosen = torch.argmin(dist, dim=2)
+    chosen_y = []
+    for b in range(len(y)):
+        chosen_y.append(y[b, chosen[b]])
+    return torch.stack(chosen_y, dim=0)
+
+def random_sample(tensor, k):
+    return tensor[:, torch.randperm(tensor.shape[1])[:k]].clone()
+
+def distance_matrix(x, y=None, p = 2): #pairwise distance of vectors
+    
+    y = x if type(y) == type(None) else y
+
+    b = x.size(0)
+    n = x.size(1)
+    m = y.size(1)
+    d = x.size(2)
+    
+    x = x.unsqueeze(2).expand(b, n, m, d)
+    y = y.unsqueeze(1).expand(b, n, m, d)
+    
+    dist = torch.linalg.vector_norm(x - y, p, 3)
+    
+    return dist
+
+class NN():
+
+    def __init__(self, X = None, Y = None, p = 2):
+        self.p = p
+        self.train(X, Y)
+
+    def train(self, X, Y):
+        self.train_pts = X
+        self.train_label = Y
+
+    def __call__(self, x):
+        return self.predict(x)
+
+    def predict(self, x):
+        if type(self.train_pts) == type(None) or type(self.train_label) == type(None):
+            name = self.__class__.__name__
+            raise RuntimeError(f"{name} wasn't trained. Need to execute {name}.train() first")
+        
+        dist = distance_matrix(x, self.train_pts, self.p)
+        labels = torch.argmin(dist, dim=2)
+        return self.train_label[labels]
+
+
+class KMeans(NN):
+
+    def __init__(self, X = None, k=2, n_iters = 10, p = 2):
+
+        self.k = k
+        self.n_iters = n_iters
+        self.p = p
+
+        if type(X) != type(None):
+            self.train(X)
+
+    def train(self, X):
+
+        self.train_pts = random_sample(X, self.k)
+        self.train_label = torch.LongTensor(range(self.k)).to(X.device)
+
+        for _ in range(self.n_iters):
+            labels = self.predict(X)
+
+            for lab in range(self.k):
+                select = labels == lab
+                select = select[..., None]
+                self.train_pts[:, lab] = torch.sum(X * select, dim=1) / select.sum(dim=1)

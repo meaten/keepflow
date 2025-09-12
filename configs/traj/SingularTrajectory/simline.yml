@@ -1,0 +1,15 @@
+MODEL:
+  TYPE: SingularTrajectory
+
+DATA:
+  DATASET_NAME: "simline"
+  TRAJ:
+    STATE: state_p
+    PRED_STATE: state_p
+SOLVER:
+  USE_SCHEDULER: True
+  ITER: 500
+  EVAL_EVERY: 10
+
+TEST:
+  KDE: True

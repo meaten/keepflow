@@ -9,6 +9,8 @@ from models.model_led_initializer import LEDInitializer as InitializationModel
 from models.model_diffusion import TransformerDenoisingModel as CoreDenoisingModel
 from trainer.train_led_trajectory_augment_input import Trainer
 
+from models.model_diffusion import social_transformer
+
 
 class LED(ModelTemplate, Trainer):
     def __init__(self, cfg):
@@ -29,7 +31,7 @@ class LED(ModelTemplate, Trainer):
         model_cp = torch.load('extern/traj/LED/results/checkpoints/base_diffusion_model.p', map_location='cpu')
         self.model.load_state_dict(model_cp['model_dict'])
   
-        self.model_initializer = InitializationModel(t_h=10, d_h=6, t_f=20, d_f=2, k_pred=20).to(self.device)
+        self.model_initializer = InitializationModel(t_h=8, d_h=6, t_f=20, d_f=2, k_pred=20).to(self.device)
         
         self.optimizer = torch.optim.AdamW(self.model_initializer.parameters(),                                            
                                            lr=1.e-3)
@@ -42,14 +44,17 @@ class LED(ModelTemplate, Trainer):
         neighbors_st = data_dict['neighbors']
         
         if len(neighbors_st) != 0:
-            batch_size = data_dict['obs'].shape[0] + sum([len(n) for n in neighbors_st])
-            partitioning_index = np.cumsum([1] + [len(n) + 1 for n in neighbors_st[:-1]]) - 1
+            past_traj = []
+            for o, n in zip(obs_st, neighbors_st):
+                past_traj.append(torch.cat([o[None], n[~torch.isnan(n[..., 0]).any(dim=1)]], dim=0))
+            partitioning_index = np.cumsum([0] + [len(n) for n in past_traj[:-1]])
+            past_traj = torch.cat(past_traj, dim=0)
+            batch_size = len(past_traj)
             traj_mask = torch.zeros(batch_size, batch_size).to(self.device)
             for i in range(len(partitioning_index) - 1):
                 traj_mask[partitioning_index[i]:partitioning_index[i+1], partitioning_index[i]:partitioning_index[i+1]] = 1.
-            traj_mask[partitioning_index[-1]:batch_size, partitioning_index[-1]:batch_size] = 1    
-        
-            past_traj = torch.cat([torch.cat([o[None], n]) for o, n in zip(obs_st, neighbors_st)])
+            traj_mask[partitioning_index[-1]:batch_size, partitioning_index[-1]:batch_size] = 1
+            
         else:  # no neighbors
             batch_size = data_dict['obs'].shape[0]
             partitioning_index = np.arange(batch_size)
@@ -57,7 +62,7 @@ class LED(ModelTemplate, Trainer):
             past_traj = obs_st
             
         
-        past_traj = torch.nn.functional.pad(past_traj, (0, 0, 10 - self.obs_len, 0), 'replicate')
+        # past_traj = torch.nn.functional.pad(past_traj, (0, 0, 10 - self.obs_len, 0), 'replicate')
         fut_traj = data_dict['gt']
         return partitioning_index, batch_size, traj_mask, past_traj, fut_traj
 

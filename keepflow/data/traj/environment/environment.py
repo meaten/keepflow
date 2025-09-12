@@ -17,6 +17,7 @@ class Environment(object):
 
         self._scenes_resample_prop = None
         
+        self.gt_dist_type = None  # for simulated data
         self.gt_dist = None  # for simulated data
 
     def get_edge_types(self):

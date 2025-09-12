@@ -1,11 +1,19 @@
 import os
+from pathlib import Path
+from tqdm import tqdm
 import numpy as np
 np.random.seed(123)
+import seaborn as sns
+import matplotlib.pyplot as plt
 import pandas as pd
 import dill
-import pickle
+import torch
+import torch.distributions as D
 
 from keepflow.data.traj.environment import Environment, Scene, Node, derivative_of
+from keepflow.visualization import plot_density
+from keepflow.visualization.traj.traj_visualizer import get_grid
+from keepflow.utils.kde import GaussianKDE
 
 desired_max_time = 100
 pred_indices = [2, 3]
@@ -31,271 +39,165 @@ standardization = {
     }
 }
 
-def maybe_makedirs(path_to_create):
-    """This function will create a directory, unless it exists already,
-    at which point the function will return.
-    The exception handling is necessary as it prevents a race condition
-    from occurring.
-    Inputs:
-        path_to_create - A string path to a directory you'd like created.
-    """
-    try:
-        os.makedirs(path_to_create)
-    except OSError:
-        if not os.path.isdir(path_to_create):
-            raise
-
-def augment_scene(scene, angle):
-    def rotate_pc(pc, alpha):
-        M = np.array([[np.cos(alpha), -np.sin(alpha)],
-                      [np.sin(alpha), np.cos(alpha)]])
-        return M @ pc
-
-    data_columns = pd.MultiIndex.from_product([['position', 'velocity', 'acceleration'], ['x', 'y']])
-
-    scene_aug = Scene(timesteps=scene.timesteps, dt=scene.dt, name=scene.name)
-
-    alpha = angle * np.pi / 180
-
-    for node in scene.nodes:
-        x = node.data.position.x.copy()
-        y = node.data.position.y.copy()
-
-        x, y = rotate_pc(np.array([x, y]), alpha)
-
-        vx = derivative_of(x, scene.dt)
-        vy = derivative_of(y, scene.dt)
-        ax = derivative_of(vx, scene.dt)
-        ay = derivative_of(vy, scene.dt)
-
-        data_dict = {('position', 'x'): x,
-                     ('position', 'y'): y,
-                     ('velocity', 'x'): vx,
-                     ('velocity', 'y'): vy,
-                     ('acceleration', 'x'): ax,
-                     ('acceleration', 'y'): ay}
-
-        node_data = pd.DataFrame(data_dict, columns=data_columns)
-
-        node = Node(node_type=node.type, node_id=node.id, data=node_data, first_timestep=node.first_timestep)
-
-        scene_aug.nodes.append(node)
-    return scene_aug
-
-
-def augment(scene):
-    scene_aug = np.random.choice(scene.augmented)
-    scene_aug.temporal_scene_graph = scene.temporal_scene_graph
-    return scene_aug
-
-
 nl = 0
 l = 0
 
 # raw_path = './keepflow/data/traj/raw_data/'
 # data_folder_name = './keepflow/data/traj/processed_data/'
 
-raw_path = '/home-local/maeda/keepflow/data/traj/'
-data_folder_name = '/home-local/maeda/keepflow/data/traj/processed_data/'
+raw_path = Path('/home-local/maeda/keepflow/data/traj/')
+output_folder_name = Path('/home-local/maeda/keepflow/data/traj/processed_data/')
 
-maybe_makedirs(data_folder_name)
+os.makedirs(output_folder_name, exist_ok=True)
 
 data_columns = pd.MultiIndex.from_product([['position', 'velocity', 'acceleration'], ['x', 'y']])
 
-"""
-# Process ETH-UCY
-for desired_source in ['eth', 'hotel', 'univ', 'zara1', 'zara2']:
-    for data_class in ['train', 'val', 'test']:
-        env = Environment(node_type_list=['PEDESTRIAN'], standardization=standardization)
-        attention_radius = dict()
-        attention_radius[(env.NodeType.PEDESTRIAN, env.NodeType.PEDESTRIAN)] = 3.0
-        env.attention_radius = attention_radius
 
-        scenes = []
-        data_dict_path = os.path.join(data_folder_name, '_'.join([desired_source, data_class]) + '.pkl')
+def preprocess_node(data, node_id, dt):
+    node_df = data[data['node_id'] == node_id]
 
-        for subdir, dirs, files in os.walk(os.path.join(raw_path, desired_source, data_class)):
-            for file in files:
-                if file.endswith('.txt'):
-                    input_data_dict = dict()
-                    full_data_path = os.path.join(subdir, file)
-                    print('At', full_data_path)
+    node_values = node_df[['pos_x', 'pos_y']].values
 
-                    data = pd.read_csv(full_data_path, sep='\t', index_col=False, header=None)
-                    data.columns = ['frame_id', 'track_id', 'pos_x', 'pos_y']
-                    data['frame_id'] = pd.to_numeric(data['frame_id'], downcast='integer')
-                    data['track_id'] = pd.to_numeric(data['track_id'], downcast='integer')
+    new_first_idx = node_df['frame_id'].iloc[0]
 
-                    data['frame_id'] = data['frame_id'] // 10
+    x = node_values[:, 0]
+    y = node_values[:, 1]
+    
+    vx = derivative_of(x, dt)
+    vy = derivative_of(y, dt)
+    ax = derivative_of(vx, dt)
+    ay = derivative_of(vy, dt)
 
-                    #data['frame_id'] -= data['frame_id'].min()
+    data_dict = {('position', 'x'): x,
+                ('position', 'y'): y,
+                ('velocity', 'x'): vx,
+                ('velocity', 'y'): vy,
+                ('acceleration', 'x'): ax,
+                ('acceleration', 'y'): ay}
 
-                    data['node_type'] = 'PEDESTRIAN'
-                    data['node_id'] = data['track_id'].astype(str)
+    node_data = pd.DataFrame(data_dict, columns=data_columns)
+    node = Node(node_type=env.NodeType.PEDESTRIAN, node_id=node_id, data=node_data)
+    node.first_timestep = new_first_idx
 
-                    data.sort_values('frame_id', inplace=True)
-                    
-                    if desired_source == "eth" and data_class == "test":
-                        data['pos_x'] = data['pos_x'] * 0.6
-                        data['pos_y'] = data['pos_y'] * 0.6
+    return node
 
-                    # if data_class == "train":
-                    #     #data_gauss = data.copy(deep=True)
-                    #     data['pos_x'] = data['pos_x'] + 2 * np.random.normal(0,1)
-                    #     data['pos_y'] = data['pos_y'] + 2 * np.random.normal(0,1)
+def plot_traj(obs, gt, path: Path, max_pos, min_pos) -> None:
+    f, ax = plt.subplots(1, 1)
+    ax.set_aspect('equal', adjustable='box')
+    ax.set_xlim(min_pos[0], max_pos[0])
+    ax.set_ylim(min_pos[1], max_pos[1])
+    
+    sns.lineplot(x=obs[:, 0], y=obs[:, 1], color='black',
+                    legend='brief', label="obs", marker='o', sort=False)
+    
+    shape = np.array(gt.shape)
+    shape[1] += 1
+    gt_vis = np.zeros(shape)
+    gt_vis[:, 0] = obs[-1]
+    gt_vis[:, 1:] = gt
+    for i in range(gt_vis.shape[0]):
+        if i == 0:
+            sns.lineplot(x=gt_vis[i, :, 0], y=gt_vis[i, :, 1],
+                            color='blue', legend='brief', label="GT", marker='o', sort=False)
+        else:
+            sns.lineplot(
+                x=gt_vis[i, :, 0], y=gt_vis[i, :, 1], color='blue', marker='o', sort=False)
 
-                        #data = pd.concat([data, data_gauss])
+    plt.legend()
+    plt.axis('off')
+    plt.savefig(path, bbox_inches='tight')
+    plt.close()
 
-                    #data['pos_x'] = data['pos_x'] - data['pos_x'].mean()
-                    #data['pos_y'] = data['pos_y'] - data['pos_y'].mean()
-
-                    max_timesteps = data['frame_id'].max()
-
-                    scene = Scene(timesteps=max_timesteps+1, dt=dt, name=file.rstrip('.txt'), aug_func=augment if data_class == 'train' else None)
-                    
-                    for node_id in pd.unique(data['node_id']):
-
-                        node_df = data[data['node_id'] == node_id]
-
-                        node_values = node_df[['pos_x', 'pos_y']].values
-
-                        if node_values.shape[0] < 2:
-                            continue
-
-                        new_first_idx = node_df['frame_id'].iloc[0]
-
-                        x = node_values[:, 0]
-                        y = node_values[:, 1]
-                        vx = derivative_of(x, scene.dt)
-                        vy = derivative_of(y, scene.dt)
-                        ax = derivative_of(vx, scene.dt)
-                        ay = derivative_of(vy, scene.dt)
-
-                        data_dict = {('position', 'x'): x,
-                                     ('position', 'y'): y,
-                                     ('velocity', 'x'): vx,
-                                     ('velocity', 'y'): vy,
-                                     ('acceleration', 'x'): ax,
-                                     ('acceleration', 'y'): ay}
-
-                        node_data = pd.DataFrame(data_dict, columns=data_columns)
-                        node = Node(node_type=env.NodeType.PEDESTRIAN, node_id=node_id, data=node_data)
-                        node.first_timestep = new_first_idx
-
-                        scene.nodes.append(node)
-                    if data_class == 'train':
-                        scene.augmented = list()
-                        angles = np.arange(0, 360, 15) if data_class == 'train' else [0]
-                        for angle in angles:
-                            scene.augmented.append(augment_scene(scene, angle))
-
-                    print(scene)
-                    scenes.append(scene)
-        print(f'Processed {len(scenes):.2f} scene for data class {data_class}')
-
-        env.scenes = scenes
-
-        if len(scenes) > 0:
-            with open(data_dict_path, 'wb') as f:
-                dill.dump(env, f, protocol=dill.HIGHEST_PROTOCOL)
-
-"""
-# Process Stanford Drone. Data obtained from Y-Net github repo
-data_columns = pd.MultiIndex.from_product([['position', 'velocity', 'acceleration'], ['x', 'y']])
-
-for data_class in ["train", "test"]:
-    data_path = os.path.join(raw_path, "stanford", f"{data_class}_trajnet.pkl")
-    print(f"Processing SDD {data_class}")
-    data_out_path = os.path.join(data_folder_name, f"sdd_{data_class}.pkl")
-    df = pickle.load(open(data_path, "rb"))
-    env = Environment(node_type_list=['PEDESTRIAN'], standardization=standardization)
-    attention_radius = dict()
-    attention_radius[(env.NodeType.PEDESTRIAN, env.NodeType.PEDESTRIAN)] = 3.0
-    env.attention_radius = attention_radius
-
-    scenes = []
-
-    group = df.groupby("sceneId")
-    for scene, data in group:
-        data['frame'] = pd.to_numeric(data['frame'], downcast='integer')
-        data['trackId'] = pd.to_numeric(data['trackId'], downcast='integer')
-
-        data['frame'] = data['frame'] // 12
-
-        #data['frame'] -= data['frame'].min()
-
-        data['node_type'] = 'PEDESTRIAN'
-        data['node_id'] = data['trackId'].astype(str)
-
-        # apply data scale as same as PECnet
-        data['x'] = data['x']/50
-        data['y'] = data['y']/50
-
-        # Mean Position
-        #data['x'] = data['x'] - data['x'].mean()
-        #data['y'] = data['y'] - data['y'].mean()
-
-        max_timesteps = data['frame'].max()
-
-        if len(data) > 0:
-
-            scene = Scene(timesteps=max_timesteps+1, dt=dt, name=scene, aug_func=augment if data_class == 'train' else None)
-            n=0
-            for node_id in pd.unique(data['node_id']):
-
-                node_df = data[data['node_id'] == node_id]
+def plot_dot(point: np.array, path: Path, max_pos, min_pos) -> None:    
+    f, ax = plt.subplots(1, 1)
+    ax.set_aspect('equal', adjustable='box')
+    ax.set_xlim(min_pos[0], max_pos[0])
+    ax.set_ylim(min_pos[1], max_pos[1])
+    
+    plt.plot(point[0], point[1], 'o', markersize=6, color='black')
+    
+    plt.axis('off')
+    plt.savefig(path, bbox_inches='tight')
+    plt.close()
 
 
-                if len(node_df) > 1:
-                    assert np.all(np.diff(node_df['frame']) == 1)
-                    if not np.all(np.diff(node_df['frame']) == 1):
-                        import pdb;pdb.set_trace()
-                        
-
-                    node_values = node_df[['x', 'y']].values
-
-                    if node_values.shape[0] < 2:
-                        continue
-
-                    new_first_idx = node_df['frame'].iloc[0]
-
-                    x = node_values[:, 0]
-                    y = node_values[:, 1]
-                    vx = derivative_of(x, scene.dt)
-                    vy = derivative_of(y, scene.dt)
-                    ax = derivative_of(vx, scene.dt)
-                    ay = derivative_of(vy, scene.dt)
-
-                    data_dict = {('position', 'x'): x,
-                                 ('position', 'y'): y,
-                                 ('velocity', 'x'): vx,
-                                 ('velocity', 'y'): vy,
-                                 ('acceleration', 'x'): ax,
-                                 ('acceleration', 'y'): ay}
-
-                    node_data = pd.DataFrame(data_dict, columns=data_columns)
-                    node = Node(node_type=env.NodeType.PEDESTRIAN, node_id=node_id, data=node_data)
-                    node.first_timestep = new_first_idx
-
-                    scene.nodes.append(node)
-            if data_class == 'train':
-                scene.augmented = list()
-                angles = np.arange(0, 360, 15) if data_class == 'train' else [0]
-                for angle in angles:
-                    scene.augmented.append(augment_scene(scene, angle))
-
-            print(scene)
-            scenes.append(scene)
-    env.scenes = scenes
-
-    if len(scenes) > 0:
-        with open(data_out_path, 'wb') as f:
-            #pdb.set_trace()
-            dill.dump(env, f, protocol=dill.HIGHEST_PROTOCOL)
-
+def visualize_env(env, path):
+    obs_len = 8
+    pred_len = 12
+    
+    os.makedirs(path, exist_ok=True)
+    # traj
+    scene = env.scenes[0]
+    max_pos, min_pos = scene.calculate_pos_min_max()
+    max_pos += 0.05 * (max_pos - min_pos)
+    min_pos -= 0.05 * (max_pos - min_pos)
+    obs = []
+    gt = []
+    for i in np.random.permutation(len(scene.nodes))[:50]:
+        obs.append(scene.nodes[i].data.data[:obs_len, :2])
+        gt.append(scene.nodes[i].data.data[obs_len:, :2])
+    obs = np.array(obs)
+    gt = np.array(gt)
+    plot_traj(obs[0], gt, path / 'traj.png', max_pos, min_pos)
+    
+    # density
+    path_density = path / 'density'
+    os.makedirs(path_density, exist_ok=True)
+    xx, yy = get_grid(500, min_pos, max_pos)
+    if env.gt_dist_type == 'gmm':
+        value = torch.Tensor(np.array([xx.flatten(), yy.flatten()])).transpose(0, 1)[None, :, None].tile(1, 1, pred_len, 1)
+        log_prob = env.gt_dist.log_prob(value)
+        prob = torch.exp(log_prob)
+    elif env.gt_dist_type == 'kde':
+        value = torch.Tensor(np.array([xx.flatten(), yy.flatten()])).transpose(0, 1).cuda()
+        prob = []
+        for i in range(pred_len):
+            prob.append(env.gt_dist[i](value))
+        prob = torch.stack(prob, dim=1)[None].cpu()
+    else:
+        raise NotImplementedError
+    for i in range(obs_len):
+        plot_dot(obs[0][i], path_density / f'{i:02}.png', max_pos, min_pos)
+    for i in range(pred_len):
+        prob[:, :, i] /= prob[:, :, i].max()
+        plot_density(xx, yy, prob[:, :, i].detach().numpy(), path_density / f'{i + obs_len:02}.png')
+    plot_density(xx, yy, prob.mean(dim=2).detach().numpy(), path_density / 'mean.png')
+    
+    # updated density
+    path_updated_density = path / 'updated_density'
+    os.makedirs(path_updated_density, exist_ok=True)
+    update_step = 2
+    if env.gt_dist_type == 'gmm':
+        means = env.gt_dist.component_distribution.mean
+        stds = torch.sqrt(env.gt_dist.component_distribution.variance)
+        _, N_modes, _ = means.shape
+        costs = (means[:update_step] - gt[0, :update_step, None]).norm(dim=-1).sum(dim=0)
+        idxs = torch.argsort(costs)[:N_modes // 2]
+        mix = D.Categorical(torch.ones(N_modes // 2))
+        comp = D.Independent(D.Normal(means[update_step:, idxs], stds[update_step:, idxs]), 1)
+        gt_dist_updated = D.MixtureSameFamily(mix, comp)
+        log_prob = gt_dist_updated.log_prob(value[:, :, update_step:])
+        prob = torch.exp(log_prob)
+    elif env.gt_dist_type == 'kde':
+        num_samples = 300
+        traj = torch.stack([torch.matmul(env.gt_dist[i].dataset, env.gt_dist[i].bw_transform.inverse())
+                            for i in range(update_step)], dim=1)
+        costs = (traj.cpu() - gt[[0], :update_step]).norm(dim=-1).sum(dim=1)
+        idxs = torch.argsort(costs)[:num_samples]
+        gt_dist_updated = [GaussianKDE(torch.matmul(env.gt_dist[i].dataset[idxs], env.gt_dist[i].bw_transform.inverse()))
+                           for i in range(update_step, pred_len)]
+        prob = torch.stack([gt_dist_updated[i](value) for i in range(pred_len - update_step)], dim=1)[None].cpu()
+    else:
+        raise NotImplementedError
+    for i in range(pred_len - update_step): 
+        prob[:, :, i] /= prob[:, :, i].max()   
+        plot_density(xx, yy, prob[:, :, i].detach().numpy(), path_updated_density / f'{i+obs_len+update_step:02}.png')
+    plot_density(xx, yy, prob.mean(dim=2).detach().numpy(), path_updated_density / 'mean.png')
+    
 
 # Process simulated dataset
-for desired_source in ['simline', 'simfork', 'simcross']:
+for desired_source in ['simfork', 'simbranch']:
+# for desired_source in [ 'simfork']:
     for data_class in ['train', 'val', 'test']:
         env = Environment(node_type_list=['PEDESTRIAN'], standardization=standardization)
         attention_radius = dict()
@@ -303,7 +205,7 @@ for desired_source in ['simline', 'simfork', 'simcross']:
         env.attention_radius = attention_radius
 
         scenes = []
-        data_dict_path = os.path.join(data_folder_name, '_'.join([desired_source, data_class]) + '.pkl')
+        data_dict_path = output_folder_name / ('_'.join([desired_source, data_class]) + '.pkl')
 
         d = {'train': 10000,
              'val': 1000,
@@ -311,38 +213,62 @@ for desired_source in ['simline', 'simfork', 'simcross']:
         N_seqs = d[data_class]
         obs_len = 8
         pred_len = 12
-        seq_len = obs_len + pred_len  # add 1 for velocity/acceleration caliculation
-        theta = np.pi / 3
-        std = 0.5
+        seq_len = obs_len + pred_len
+        theta = np.pi / 6
+        std = 0.3
         
         traj_base = []
         for sgn in [1, -1]:
             traj_flat_x = np.arange(-obs_len+1, 1., 1., dtype=float)
             traj_flat_y = np.zeros_like(traj_flat_x, dtype=float)
-            traj_flat = np.concatenate([traj_flat_x[:, None], traj_flat_y[:, None]], axis=1)
+            traj_flat = np.concatenate([traj_flat_x[:, None], traj_flat_y[:, None]], axis=1)[None]
             
             if desired_source == 'simline':
                 dist = np.arange(1., pred_len+1., 1., dtype=float)
-                traj_ramp_x = dist
-                traj_ramp_y = np.zeros_like(traj_ramp_x)
+                traj_fut_x = dist
+                traj_fut_y = np.zeros_like(traj_fut_x)
+                traj_fut = np.concatenate([traj_fut_x[:, None], traj_fut_y[:, None]], axis=1)[None]
             elif desired_source == 'simfork':
                 dist = np.arange(1., pred_len+1., 1., dtype=float)
-                traj_ramp_x = dist * np.cos(sgn * theta, dtype=float)
-                traj_ramp_y = dist * np.sin(sgn * theta, dtype=float)
+                traj_fut_x = dist * np.cos(sgn * theta, dtype=float)
+                traj_fut_y = dist * np.sin(sgn * theta, dtype=float)
+                traj_fut = np.concatenate([traj_fut_x[:, None], traj_fut_y[:, None]], axis=1)[None]
             elif desired_source == 'simcross':
                 dist = np.arange(1., pred_len+1., 1., dtype=float)
-                traj_ramp_x = dist * np.cos(sgn * theta, dtype=float)
-                dist = np.concatenate([np.arange(1., pred_len // 3 + 1., 1., dtype=float), np.arange(pred_len // 3 - 1., -pred_len // 3 - 1., -1., dtype=float)])
-                traj_ramp_y = dist * np.sin(sgn * theta, dtype=float)
+                traj_fut_x = dist * np.cos(sgn * theta, dtype=float)
+                dist = np.concatenate([np.arange(1., pred_len // 3 + 1., 1., dtype=float),
+                                       np.arange(pred_len // 3 - 1., -pred_len // 3 + 1., -1., dtype=float)])
+                traj_fut_y = dist * np.sin(sgn * theta, dtype=float)
+                traj_fut = np.concatenate([traj_fut_x[:, None], traj_fut_y[:, None]], axis=1)[None]
+            elif desired_source == 'simbranch':
+                dist = np.arange(1., pred_len+1., 1., dtype=float)
+                traj_fut_x = dist * np.cos(sgn * theta, dtype=float)
+                traj_fut_y1 = dist * np.sin(sgn * theta, dtype=float)
+                dist = np.concatenate([np.arange(1., pred_len // 2 + 1, 1., dtype=float),
+                                       np.arange(pred_len // 2 + 1, 1., -1., dtype=float)])
+                traj_fut_y2 = dist * np.sin(sgn * theta, dtype=float)
+                traj_fut1 = np.concatenate([traj_fut_x[:, None], traj_fut_y1[:, None]], axis=1)[None]
+                traj_fut2 = np.concatenate([traj_fut_x[:, None], traj_fut_y2[:, None]], axis=1)[None]
+                traj_fut = np.concatenate([traj_fut1, traj_fut2], axis=0)
                 
-            traj_ramp = np.concatenate([traj_ramp_x[:, None], traj_ramp_y[:, None]], axis=1)
-            _traj = np.concatenate([traj_flat, traj_ramp], axis=0)
-    
+            _traj = np.concatenate([np.tile(traj_flat, (len(traj_fut), 1, 1)), traj_fut], axis=1)
             traj_base.append(_traj)
-        traj_base = np.array(traj_base)
+        traj_base = np.concatenate(traj_base, axis=0)
         
         traj = np.tile(traj_base, (int(N_seqs / traj_base.shape[0]), 1, 1))
-        traj += np.random.normal(loc=np.zeros_like(traj), scale=np.ones_like(traj) * std)
+        # traj[:, -pred_len:] += np.random.normal(loc=np.zeros_like(traj[:, -pred_len:]), scale=np.ones_like(traj[:, -pred_len:]) * std)
+        # traj += np.random.normal(loc=np.zeros_like(traj), scale=np.ones_like(traj) * std)
+        shape = np.array(traj.shape)
+
+        # linear_scale
+        if False:
+            shape[1] = 1
+            scale = np.arange(1., pred_len+1., 1., dtype=float)[None, :, None] / pred_len
+            traj[:, -pred_len:] += np.random.normal(loc=np.zeros(shape), scale=np.ones(shape) * std) * scale
+        # random whole
+        if True:
+            scale = np.ones(shape)[[0], -pred_len:] * std
+            traj += np.random.normal(loc=np.zeros(shape), scale=np.ones(shape) * std)
         
         id_seq = np.tile(np.arange(N_seqs)[:, None, None], [1, seq_len, 1])
         traj = np.concatenate([id_seq, traj], axis=2)
@@ -354,65 +280,36 @@ for desired_source in ['simline', 'simfork', 'simcross']:
         data['frame_id'] = pd.to_numeric(data['frame_id'], downcast='integer')
         data['track_id'] = pd.to_numeric(data['track_id'], downcast='integer')
 
-        #data['frame_id'] = data['frame_id'] // 10
-
         data['node_type'] = 'PEDESTRIAN'
         data['node_id'] = data['track_id'].astype(str)
 
         data.sort_values('frame_id', inplace=True)
-        
-        #data['pos_x'] = data['pos_x'] - data['pos_x'].mean()
-        #data['pos_y'] = data['pos_y'] - data['pos_y'].mean()
-
         max_timesteps = data['frame_id'].max()
 
         scene = Scene(timesteps=max_timesteps+1, dt=dt, name=f'{desired_source}_{data_class}', aug_func=None)
-
-        for node_id in pd.unique(data['node_id']):
-
-            node_df = data[data['node_id'] == node_id]
-
-            node_values = node_df[['pos_x', 'pos_y']].values
-
-            if node_values.shape[0] < 2:
-                continue
-
-            new_first_idx = node_df['frame_id'].iloc[0]
-
-            x = node_values[:, 0]
-            y = node_values[:, 1]
-            
-            vx = derivative_of(x, scene.dt)
-            vy = derivative_of(y, scene.dt)
-            ax = derivative_of(vx, scene.dt)
-            ay = derivative_of(vy, scene.dt)
-
-            data_dict = {('position', 'x'): x,
-                            ('position', 'y'): y,
-                            ('velocity', 'x'): vx,
-                            ('velocity', 'y'): vy,
-                            ('acceleration', 'x'): ax,
-                            ('acceleration', 'y'): ay}
-
-            node_data = pd.DataFrame(data_dict, columns=data_columns)
-            node = Node(node_type=env.NodeType.PEDESTRIAN, node_id=node_id, data=node_data)
-            node.first_timestep = new_first_idx
-
-            scene.nodes.append(node)
-            
-        env.gt_dist = np.concatenate([traj_base, np.ones_like(traj_base) * std], axis=2)
-        
+        scene.nodes = [preprocess_node(data, node_id, dt) for node_id in tqdm(pd.unique(data['node_id']))]
         print(scene)
         scenes.append(scene)
         print(f'Processed {len(scenes):.2f} scene for data class {data_class}')
 
         env.scenes = scenes
-
+        
+        if data_class == 'test':
+            env.gt_dist_type = 'gmm'
+            traj_base = traj_base.transpose(1, 0, 2)
+            scale = scale.transpose(1, 0, 2)
+            mix = D.Categorical(torch.ones(traj_base[-pred_len:].shape[:2]))
+            comp = D.Independent(D.Normal(torch.tensor(traj_base[-pred_len:]), torch.tensor(scale * std)), 1)
+            env.gt_dist = D.MixtureSameFamily(mix, comp)
+            
+            path = output_folder_name / 'visualize' / f'{desired_source}_{data_class}'
+            visualize_env(env, path)
+            
         if len(scenes) > 0:
             with open(data_dict_path, 'wb') as f:
                 dill.dump(env, f, protocol=dill.HIGHEST_PROTOCOL)
 
-
+"""
 # Process simulated dataset
 for desired_source in ['simunicycle']:
     for data_class in ['train', 'val', 'test']:
@@ -422,7 +319,7 @@ for desired_source in ['simunicycle']:
         env.attention_radius = attention_radius
 
         scenes = []
-        data_dict_path = os.path.join(data_folder_name, '_'.join([desired_source, data_class]) + '.pkl')
+        data_dict_path = output_folder_name / ('_'.join([desired_source, data_class]) + '.pkl')
 
         d = {'train': 10000,
              'val': 1000,
@@ -430,10 +327,10 @@ for desired_source in ['simunicycle']:
         N_seqs = d[data_class]
         obs_len = 8
         pred_len = 12
-        seq_len = obs_len + pred_len  # add 1 for velocity/acceleration caliculation
+        seq_len = obs_len + pred_len
         
-        theta = np.pi / 2
-        vel = 0.1
+        max_pos_change = 0.1
+        max_ang_acc = np.pi / 3 / pred_len
         
         traj_flat_x = np.arange(-obs_len+1, 1., 1., dtype=float)
         traj_flat_y = np.zeros_like(traj_flat_x, dtype=float)
@@ -441,89 +338,60 @@ for desired_source in ['simunicycle']:
         
         traj_flat = np.tile(traj_flat[None], (int(N_seqs), 1, 1))
         
-        max_vel = np.arange(1, pred_len + 1) / pred_len * vel
-        max_theta = np.arange(1, pred_len + 1) / pred_len * theta
+        max_ang_vel = np.arange(1, pred_len + 1) * max_ang_acc
         
         traj_flat_vel_x = np.ones(pred_len)
         traj_flat_vel_y = np.zeros(pred_len)
         traj_flat_vel = np.concatenate([traj_flat_vel_x[:, None], traj_flat_vel_y[:, None]], axis=1)
         traj_flat_vel = np.tile(traj_flat_vel[None], (int(N_seqs), 1, 1))
         
-        traj_flat_vel[..., 0] += np.random.uniform(low=-1.0, high=1.0, size=N_seqs)[:, None] * max_vel[None, :]
+        traj_flat_vel[..., 0, 0] += np.random.uniform(low=-1.0, high=1.0, size=N_seqs) * max_pos_change
         
-        deg = np.random.uniform(low=-1.0, high=1.0, size=N_seqs)[:, None] * max_theta[None, :]
+        deg = np.random.uniform(low=-1.0, high=1.0, size=N_seqs)[:, None] * max_ang_vel[None, :]
         c, s = np.cos(deg), np.sin(deg)
         upper = np.stack([c, s], axis=-1)
         lower = np.stack([-s, c], axis=-1)
         rotmat = np.stack([upper, lower], axis=-2)
         traj_fanshape_vel = np.einsum('ijkl,ijk->ijl', rotmat, traj_flat_vel)
         traj_fanshape = np.cumsum(traj_fanshape_vel, axis=1)
-        traj_fanshape[..., 0] -= 1
         
         traj = np.concatenate([traj_flat, traj_fanshape], axis=1)
         id_seq = np.tile(np.arange(N_seqs)[:, None, None], [1, seq_len, 1])
         traj = np.concatenate([id_seq, traj], axis=2)
+        traj[..., 0] *= 0.7
         
         id_frame = np.arange(N_seqs * seq_len)[:, None]
-        traj = np.concatenate([id_frame, traj.reshape([N_seqs * seq_len, -1])], axis=1)
+        traj = np.concatenate([id_frame, traj.reshape([N_seqs * seq_len, -1])], axis=1) 
 
         data = pd.DataFrame(traj, columns=['frame_id', 'track_id', 'pos_x', 'pos_y'])
         data['frame_id'] = pd.to_numeric(data['frame_id'], downcast='integer')
         data['track_id'] = pd.to_numeric(data['track_id'], downcast='integer')
 
-        #data['frame_id'] = data['frame_id'] // 10
-
         data['node_type'] = 'PEDESTRIAN'
         data['node_id'] = data['track_id'].astype(str)
 
         data.sort_values('frame_id', inplace=True)
-        
-        #data['pos_x'] = data['pos_x'] - data['pos_x'].mean()
-        #data['pos_y'] = data['pos_y'] - data['pos_y'].mean()
 
         max_timesteps = data['frame_id'].max()
 
         scene = Scene(timesteps=max_timesteps+1, dt=dt, name=f'{desired_source}_{data_class}', aug_func=None)
-
-        for node_id in pd.unique(data['node_id']):
-
-            node_df = data[data['node_id'] == node_id]
-
-            node_values = node_df[['pos_x', 'pos_y']].values
-
-            if node_values.shape[0] < 2:
-                continue
-
-            new_first_idx = node_df['frame_id'].iloc[0]
-
-            x = node_values[:, 0]
-            y = node_values[:, 1]
-            vx = derivative_of(x, scene.dt)
-            vy = derivative_of(y, scene.dt)
-            ax = derivative_of(vx, scene.dt)
-            ay = derivative_of(vy, scene.dt)
-
-            data_dict = {('position', 'x'): x,
-                            ('position', 'y'): y,
-                            ('velocity', 'x'): vx,
-                            ('velocity', 'y'): vy,
-                            ('acceleration', 'x'): ax,
-                            ('acceleration', 'y'): ay}
-
-            node_data = pd.DataFrame(data_dict, columns=data_columns)
-            node = Node(node_type=env.NodeType.PEDESTRIAN, node_id=node_id, data=node_data)
-            node.first_timestep = new_first_idx
-
-            scene.nodes.append(node)
-            
-        #env.gt_dist = np.concatenate([traj_base, np.ones_like(traj_base) * std], axis=2)
-        
+        scene.nodes = [preprocess_node(data, node_id, dt) for node_id in tqdm(pd.unique(data['node_id']))]
         print(scene)
         scenes.append(scene)
         print(f'Processed {len(scenes):.2f} scene for data class {data_class}')
-
         env.scenes = scenes
-
+        
         if len(scenes) > 0:
             with open(data_dict_path, 'wb') as f:
                 dill.dump(env, f, protocol=dill.HIGHEST_PROTOCOL)
+        
+        if data_class == 'test':
+            env.gt_dist_type = 'kde'
+            data = torch.Tensor(traj_fanshape).cuda()
+            kdes = []
+            for i in range(pred_len):
+                kdes.append(GaussianKDE(data[:, i]))
+            env.gt_dist = kdes
+            path = output_folder_name / 'visualize' / f'{desired_source}_{data_class}'
+            visualize_env(env, path)
+"""

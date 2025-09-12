@@ -1,6 +1,6 @@
 import sys
 from yacs.config import CfgNode
-from typing import Dict, Tuple
+from typing import Dict
 from pathlib import Path
 import torch
 import torch.nn as nn
@@ -9,7 +9,6 @@ import torch.optim as optim
 from keepflow.models import ModelTemplate
 sys.path.append('extern/traj/sgan')
 from sgan.models import TrajectoryGenerator, SocialPooling
-from sgan.losses import l2_loss
 from scripts.train import init_weights
 
 
@@ -57,11 +56,18 @@ class socialLSTM(ModelTemplate):
 
     def predict(self, data_dict: Dict, return_prob=False) -> Dict:
         obs_slstm, obs_slstm_rel, seq_start_end_slstm = self.data_dict_to_slstm(data_dict)
-        pred_traj_fake_rel = self.g.forward(obs_slstm.permute(1, 0, 2).contiguous(),
-                                        obs_slstm_rel.permute(1, 0, 2).contiguous(),
-                                        seq_start_end_slstm)
-        pred_traj_fake_rel = pred_traj_fake_rel.permute(1, 0, 2)
-        data_dict[("pred", 0)] = pred_traj_fake_rel[seq_start_end_slstm[:, 0]]
+
+        n_sample = 20
+
+        pred = []
+        for _ in range(n_sample):
+            pred_traj_fake_rel = self.g.forward(obs_slstm.permute(1, 0, 2).contiguous(),
+                                            obs_slstm_rel.permute(1, 0, 2).contiguous(),
+                                            seq_start_end_slstm)
+            pred_traj_fake_rel = pred_traj_fake_rel.permute(1, 0, 2)[seq_start_end_slstm[:, 0]]
+            pred.append(pred_traj_fake_rel)
+        pred = torch.stack(pred, dim=1)
+        data_dict[("pred", 0)] = pred
         return data_dict
 
     def data_dict_to_slstm(self, data_dict):

@@ -15,7 +15,6 @@ hypers_nuscenes = {
         'position': ['x', 'y'],
         'velocity': ['x', 'y'],
         'acceleration': ['x', 'y'],
-        "heading": ["\u00b0", "d\u00b0"]
         }
     },
     "batch_size": 256,
@@ -94,7 +93,6 @@ hypers_nuscenes = {
             "position": ["x", "y"],
             "velocity": ["x", "y"],
             "acceleration": ["x", "y"],
-            "heading": ["\u00b0", "d\u00b0"]
         }
     },
     "pred_state": {
@@ -126,16 +124,14 @@ hypers_nuscenes = {
 
 
 hypers_pedestrian = {
-    'state_p': {'PEDESTRIAN': {'position': ['x', 'y']}},
-    'state_v': {'PEDESTRIAN': {'velocity': ['x', 'y']}},
-    'state_a': {'PEDESTRIAN': {'acceleration': ['x', 'y']}},
+    'state_p': {'position': ['x', 'y']},
+    'state_v': {'velocity': ['x', 'y']},
+    'state_a': {'acceleration': ['x', 'y']},
     'state_pva': {
-        'PEDESTRIAN': {
         'position': ['x', 'y'],
         'velocity': ['x', 'y'],
         'acceleration': ['x', 'y']
-        }
-    },
+        },
     'batch_size': 256,
     'grad_clip': 1.0,
     'learning_rate_style': 'exp',

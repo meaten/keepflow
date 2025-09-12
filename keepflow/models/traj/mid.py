@@ -6,8 +6,8 @@ import torch
 import torch.optim as optim
 from trajdata.data_structures import AgentType
 
+from keepflow.data.traj import EmptyEnv
 from keepflow.models import ModelTemplate
-from keepflow.utils import EmptyEnv
 sys.path.append('extern/traj/MID')
 from utils.model_registrar import ModelRegistrar
 from utils.trajectron_hypers import get_traj_hypers
@@ -95,13 +95,13 @@ class MID(ModelTemplate):
     def predict(self, data_dict, return_prob=False):
         batch = self.create_batch(data_dict)
         
-        n_sample = 10000 if return_prob else 1
+        n_sample = 10000 if return_prob else 20
         
         node_type = str(AgentType(data_dict['agent_type'][0].item())).lstrip('AgentType.')  # assume all agnet types are the same in this minibatch
         traj_pred = self.model.generate(batch, node_type, num_points=12, sample=n_sample, bestof=True, step=1)
         traj_pred = traj_pred.permute(1, 0, 2, 3)
         
-        data_dict[("pred", 0)] = traj_pred[:, 0]
+        data_dict[("pred", 0)] = traj_pred
         
         if return_prob:
             traj_pred = torch.cat([traj_pred, torch.zeros_like(traj_pred)], dim=3)
@@ -138,7 +138,7 @@ class MID(ModelTemplate):
         if path is None:
             path = self.model_path
         
-        ckpt = torch.load(path, map_location=self.device)
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.registrar.load_models(ckpt['encoder'])
         
         # craete new Trajectron with loaded weights

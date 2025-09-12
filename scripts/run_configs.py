@@ -18,7 +18,7 @@ def parse_args() -> argparse.Namespace:
 def run_parallel(args: argparse.Namespace) -> None:
     train_cmd = ["python3", "train.py", ]
     if args.visualize:
-        test_cmd = ["python3", "test.py", "--visualize"]
+        test_cmd = ["python3", "test.py", "--visualize", "10"]
     else:
         test_cmd = ["python3", "test.py"]
 
@@ -32,8 +32,8 @@ def run_parallel(args: argparse.Namespace) -> None:
     
     cmds = []
     for base, c in itertools.product(base_cmds, config_files):
-        if 'sim' in str(c):
-            continue
+        # if 'sim' not in str(c):
+            # continue
             
         cmd = base + [
                     "--device",

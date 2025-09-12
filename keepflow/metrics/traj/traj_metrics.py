@@ -23,18 +23,14 @@ class TrajMetrics(object):
         self.dataset = cfg.DATA.DATASET_NAME
         
     # TODO : calculate metrics on updated trajectory e.g. ("pred", 1), ("pred", 2)
-    def __call__(self, dict_list: List) -> Dict:
-        ade, fde, emd, log_prob = [], [], [], []
-        for data_dict in dict_list:
-            ade.append(displacement_error(data_dict[('pred', 0)][:, :self.pred_len], data_dict['gt'][:, :self.pred_len]))
-            fde.append(final_displacement_error(data_dict[('pred', 0)][:, -1], data_dict['gt'][:, -1]))
-            # emd.append(self.emd(data_dict))
-            log_prob.append(self.log_prob(data_dict))
-        
+    def __call__(self, result_dict: Dict) -> Dict:
+        ade = displacement_error(result_dict[('pred', 0)][:, :, :self.pred_len], result_dict['gt'][:, None, :self.pred_len])
+        fde = final_displacement_error(result_dict[('pred', 0)][:, :, -1], result_dict['gt'][:, None, -1])
+        # emd.append(self.emd(data_dict))
+        log_prob = self.log_prob(result_dict)
+    
         ade = evaluate_helper(ade) 
         fde = evaluate_helper(fde)
-        # emd = evaluate_helper(emd)
-        log_prob = evaluate_helper(log_prob)
 
         ade /= self.scale
         fde /= self.scale
@@ -42,22 +38,20 @@ class TrajMetrics(object):
             ade /= 0.6
             fde /= 0.6
         if self.dataset == 'sdd':
-            ade *= 50
-            fde *= 50
-            # scale_meter_to_px = retrieve_scale_sdd(data_dict).to(ade.device)
-            # ade /= scale_meter_to_px
-            # fde /= scale_meter_to_px
-        
-        return {"score": ade.cpu().numpy() + fde.cpu().numpy(),
-                "ade": ade.cpu().numpy(),
-                "fde": fde.cpu().numpy(),
-                # "emd": emd.cpu().numpy(),
-                "log_prob": log_prob.cpu().numpy()}
+            scale = [SDD_HOMOGRAPHY_SCALES[result_dict['index'][i][0]]['scale'] for i in range(len(result_dict['index']))]
+            scale = torch.Tensor(scale).to(self.device)
+            ade /= scale
+            fde /= scale
+            
+        results_dict = {"score": ade.cpu().numpy() + fde.cpu().numpy(),
+                        "ade": ade.cpu().numpy(),
+                        "fde": fde.cpu().numpy()}
+        if log_prob is not None:
+            results_dict["log_prob"] = log_prob.cpu().numpy()
+        return results_dict
     
-    def denormalize(self, dict_list: List) -> List:
-        for data_dict in dict_list:
-            data_dict = self.output_to_trajectories(data_dict)
-        return dict_list
+    def denormalize(self, result_dict: Dict) -> Dict:
+        return self.output_to_trajectories(result_dict)
     
     def output_to_trajectories(self, data_dict: Dict) -> Dict:
         if self.pred_state == 'state_p':
@@ -70,7 +64,7 @@ class TrajMetrics(object):
             
             for k in data_dict.keys():
                 if k[0] == "pred" and type(data_dict[k]) == torch.Tensor:
-                    data_dict[k] += data_dict['standardize_offset'][..., 0:2]
+                    data_dict[k] += data_dict['standardize_offset'][:, None, :, 0:2]
                     
                 if k[0] == "prob" and type(data_dict[k]) == torch.Tensor:
                     offset = data_dict['standardize_offset'][:, None, :, 0:2]
@@ -92,8 +86,8 @@ class TrajMetrics(object):
             for k in data_dict.keys():
                 if k[0] == "pred" and type(data_dict[k]) == torch.Tensor:
                     offset = data_dict['obs'][..., [-1], :] if k[1] == 0 else data_dict['gt'][..., [k[1]-1], :]
-                    data_dict[k][..., 0] += vel_norm
-                    data_dict[k] = self.integrate(data_dict[k], data_dict['dt'], dim=1) + offset
+                    data_dict[k][..., 0] += vel_norm[:, None]
+                    data_dict[k] = self.integrate(data_dict[k], data_dict['dt'], dim=2) + offset[:, None]
                 if k[0] == "prob" and type(data_dict[k]) == torch.Tensor:
                     offset = data_dict['obs'][:, None, [-1]] if k[1] == 0 else data_dict['gt'][:, None, [k[1]-1]]
                     data_dict[k][..., 0] += vel_norm[:, None]
@@ -105,7 +99,7 @@ class TrajMetrics(object):
         return torch.cumsum(seq, dim=dim) * dt.view(dt.shape + (1,) * (dim + 1))
             
     def emd(self, data_dict):
-        if ("prob", 0) not in data_dict or ("gt_prob") not in data_dict:
+        if ("prob", 0) not in data_dict or ("gt_prob", 0) not in data_dict:
             return torch.Tensor([0.0])
         
         key = None
@@ -147,10 +141,15 @@ class TrajMetrics(object):
                 
     def log_prob(self, data_dict):
         # we assume batch_size = 1
-        if ("gt_traj_log_prob", 0) in data_dict:        
-            return data_dict[("gt_traj_log_prob", 0)].nanmean(dim=-1)
+        if ("gt_traj_log_prob", 0) in data_dict:      
+            log_prob_per_step = []
+            for k in data_dict.keys():
+                if k[0] == "gt_traj_log_prob":
+                    log_prob_per_step.append(data_dict[k].nanmean(dim=-1))
+            log_prob_per_step = torch.stack(log_prob_per_step, dim=1)
+            return log_prob_per_step
         else:
-            return torch.Tensor([0.0])
+            return None
         
     def compute_road_violations(self, node_type, data_dict):
         channel = 0
@@ -217,9 +216,8 @@ def interpolate_traj(traj, num_interp=4):
         
 
 def evaluate_helper(error):
-    error = torch.stack(error, dim=0)
-    min_error_sum = torch.min(error, dim=0)[0]
-    return min_error_sum
+    min_error = torch.min(error, dim=1)[0]
+    return min_error
 
 def displacement_error(pred_traj, gt_traj):
     """
@@ -230,7 +228,7 @@ def displacement_error(pred_traj, gt_traj):
     Output:
     - loss: gives the eculidian displacement error
     """    
-    return torch.norm(pred_traj - gt_traj, dim=2).nanmean(dim=1)
+    return torch.norm(pred_traj - gt_traj, dim=-1).nanmean(dim=-1)
     
 
 def final_displacement_error(pred_pos, gt_pos):
@@ -242,7 +240,7 @@ def final_displacement_error(pred_pos, gt_pos):
     Output:
     - loss: gives the euclidian displacement error
     """
-    return torch.norm(pred_pos - gt_pos, dim=1)
+    return torch.norm(pred_pos - gt_pos, dim=-1)
 
 
 def retrieve_scale_sdd(data_dict):

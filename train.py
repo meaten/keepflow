@@ -1,9 +1,7 @@
 import argparse
 from typing import List, Dict
-from copy import deepcopy
 from collections import OrderedDict
 from tqdm import tqdm
-import dill
 from yacs.config import CfgNode
 import numpy as np
 import torch
@@ -52,29 +50,31 @@ def train(cfg: CfgNode, save_model=True, load_model=True) -> None:
         from timm.scheduler import CosineLRScheduler
         schedulers = [CosineLRScheduler(optimizer,
                                         t_initial=cfg.SOLVER.ITER,
-                                        lr_min=cfg.SOLVER.LR * cfg.SOLVER.LR_MIN_RATIO, 
-                                        warmup_t=5,
+                                        lr_min=cfg.SOLVER.LR * cfg.SOLVER.LR_MIN_RATIO,
                                         warmup_lr_init=cfg.SOLVER.LR * cfg.SOLVER.LR_MIN_RATIO,
-                                        warmup_prefix=True)
-                      for optimizer in model.optimizers]
+                                        warmup_t=5,) for optimizer in model.optimizers]
     
     counter_early_stop = 0
     np.set_printoptions(precision=4)
-    with tqdm(range(start_epoch, cfg.SOLVER.ITER)) as pbar:
-        for i in pbar:
-            if cfg.SOLVER.USE_SCHEDULER:
-                [scheduler.step(i) for scheduler in schedulers]
-                
+    with tqdm(range(start_epoch, cfg.SOLVER.ITER), leave=False) as pbar:
+        for i in pbar:    
             loss_list = []
             for _, data_dict in tqdm(enumerate(data_loader), total=len(data_loader), leave=False):
                 data_dict = dict_to_device(data_dict, cfg.DEVICE)
                 loss_list.append(model.training_step(data_dict))
-                
+            
             loss_info = aggregate(loss_list)
             pbar.set_postfix(OrderedDict(loss_info))
             
+            if np.isnan(loss_info["loss"]):
+                val_score = None
+                break
+            
+            if cfg.SOLVER.USE_SCHEDULER:
+                [scheduler.step(i) for scheduler in schedulers]
+            
             # validation
-            if (i+1) % cfg.SOLVER.SAVE_EVERY == 0:
+            if (i+1) % cfg.SOLVER.EVAL_EVERY == 0:
                 if validation:
                     result_metrics = evaluate_model(cfg, model, val_data_loader)
                     print(result_metrics)
@@ -107,14 +107,10 @@ def evaluate_model(cfg: CfgNode, model: torch.nn.Module, data_loader):
         result_list = []
         for _, data_dict in tqdm(enumerate(data_loader), total=len(data_loader), leave=False):
             data_dict = dict_to_device(data_dict, cfg.DEVICE)
-
-            dict_list = []
-            for _ in range(cfg.TEST.N_TRIAL):
-                dict_list.append(copy_dict(model.predict(data_dict, return_prob=False)))
+            result_dict = model.predict(data_dict, return_prob=False)
+            result_dict = metrics.denormalize(result_dict)
+            result_list.append(metrics(result_dict))
             
-            dict_list = metrics.denormalize(dict_list) 
-            result_list.append(copy_dict(metrics(dict_list)))
-        
         d = aggregate(result_list)
         result_metrics.update({k: d[k] for k in d.keys() if d[k] != 0.0})
     
@@ -128,21 +124,9 @@ def dict_to_device(d, device):
             else d[k]
             for k in d}
 
-
-def copy_dict(d):
-    return {k: d[k].clone()
-            if isinstance(d[k], torch.Tensor)
-            else d[k]
-            for k in d}
-
-
 def aggregate(dict_list: List[Dict]) -> Dict:
     ret_dict = {k: np.concatenate([d[k] if type(d[k]) == np.ndarray else [d[k]] for d in dict_list], axis=0) for k in dict_list[0].keys()}
-    ret_dict = {k: np.nanmean(ret_dict[k]) for k in ret_dict}
-    ret_dict = {k: float(ret_dict[k]) for k in ret_dict}
-    for k in ret_dict:
-        if k not in ['loss']:
-            ret_dict[k] = np.round(ret_dict[k], 3)
+    ret_dict = {k: np.nanmean(ret_dict[k], axis=0) for k in ret_dict}
     return ret_dict
 
 

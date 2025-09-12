@@ -19,3 +19,6 @@
 [submodule "extern/traj/sgan"]
 	path = extern/traj/sgan
 	url = https://github.com/agrimgupta92/sgan.git
+[submodule "extern/traj/SingularTrajectory"]
+	path = extern/traj/SingularTrajectory
+	url = https://github.com/InhwanBae/SingularTrajectory.git

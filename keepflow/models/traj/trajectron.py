@@ -8,8 +8,8 @@ from trajdata.data_structures import AgentType
 import warnings
 warnings.simplefilter("ignore")
 
+from keepflow.data.traj import EmptyEnv
 from keepflow.models import ModelTemplate
-from keepflow.utils import EmptyEnv
 sys.path.append('extern/traj/trajectron/trajectron')
 from model import MultimodalGenerativeCVAE
 from model.model_registrar import ModelRegistrar

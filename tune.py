@@ -35,21 +35,21 @@ def tune(cfg: CfgNode) -> None:
         
         def objective(trial):
             _cfg.MODEL.FLOW.N_HIDDEN = trial.suggest_int(
-                "MODEL.FLOW.N_HIDDEN", 1, 3)
+                "MODEL.FLOW.N_HIDDEN", 3, 15, step=3)
             _cfg.MODEL.FLOW.HIDDEN_SIZE = trial.suggest_int(
-                "MODEL.FLOW.HIDDEN_SIZE", 16, 128, step=16)
+                "MODEL.FLOW.HIDDEN_SIZE", 64, 64, step=16)
             _cfg.MODEL.FLOW.COND_SIZE = trial.suggest_int(
-                "MODEL.FLOW.COND_SIZE", 16, 128, step=16)
+                "MODEL.FLOW.COND_SIZE", 112, 112, step=16)
             _cfg.MODEL.FLOW.BASE_SIGMA = trial.suggest_float(
                 "MODEL.FLOW.BASE_SIGMA", 1e-3, 1e-0, log=True)
             _cfg.SOLVER.LR = trial.suggest_float(
-                "SOLVER.LR", 1e-5, 1e-3, log=True)
+                "SOLVER.LR", 1e-5, 5e-3, log=True)
             
             return train(_cfg, save_model=False, load_model=False)
     
         return objective
 
-    sampler = optuna.samplers.TPESampler()
+    sampler = optuna.samplers.TPESampler(multivariate=True, group=True)
     pruner = optuna.pruners.HyperbandPruner()
     
     study = optuna.create_study(sampler=sampler, pruner=pruner,

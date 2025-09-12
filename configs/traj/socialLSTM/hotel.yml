@@ -3,11 +3,11 @@ MODEL:
 
 DATA:
   DATASET_NAME: "hotel"
-  BATCH_SIZE: 64
   TRAJ:
     STATE: state_pva
     PRED_STATE: state_v
     
 SOLVER:
   USE_SCHEDULER: True
-  SAVE_EVERY: 10
+  EVAL_EVERY: 10
+  BATCH_SIZE: 64

@@ -1,0 +1,16 @@
+MODEL:
+  TYPE: SingularTrajectory
+
+DATA:
+  DATASET_NAME: "hotel"
+  TRAJ:
+    STATE: state_p
+    PRED_STATE: state_p
+    
+SOLVER:
+  BATCH_SIZE: 512
+  ITER: 256
+  USE_SCHEDULER: True
+
+TEST:
+  KDE: True
