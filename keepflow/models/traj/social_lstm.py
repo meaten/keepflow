@@ -54,11 +54,9 @@ class socialLSTM(ModelTemplate):
         self.pos_idx = [0, 1]
         self.vel_idx = [2, 3]
 
-    def predict(self, data_dict: Dict, return_prob=False) -> Dict:
+    def predict(self, data_dict: Dict, return_prob=False, n_sample=20) -> Dict:
         obs_slstm, obs_slstm_rel, seq_start_end_slstm = self.data_dict_to_slstm(data_dict)
-
-        n_sample = 20
-
+        
         pred = []
         for _ in range(n_sample):
             pred_traj_fake_rel = self.g.forward(obs_slstm.permute(1, 0, 2).contiguous(),
@@ -84,8 +82,10 @@ class socialLSTM(ModelTemplate):
         for o, n, nt in zip(obs, neighbors, neighbor_type):
             list_o_n.append(o[None])
             list_o_n.append(n[nt != -1])
-        obs_slstm = torch.concat(list_o_n, dim=0)
-        # assert torch.all(obs_slstm[seq_start_end_slstm[:, 0]] == data_dict["obs"])
+        
+        obs_slstm = torch.concat(list_o_n, dim=0).nan_to_num()
+        
+        assert torch.all(obs_slstm[seq_start_end_slstm[:, 0]] == data_dict["obs"])
         obs_slstm_rel = obs_slstm[..., self.vel_idx]
         obs_slstm = obs_slstm[..., self.pos_idx]
         
@@ -94,10 +94,10 @@ class socialLSTM(ModelTemplate):
     def training_step(self, data_dict: Dict) -> Dict:
         g_loss = 0
         
-        data_dict = self.predict(data_dict)
+        data_dict = self.predict(data_dict, n_sample=1)
         loss_mask = ~torch.isnan(data_dict['gt'])
         if self.l2_loss_weight > 0:
-            g_l2_loss_rel = self.l2_loss_weight * (data_dict[('pred', 0)] - data_dict['gt'].nan_to_num()) ** 2
+            g_l2_loss_rel = self.l2_loss_weight * (data_dict[('pred', 0)].squeeze() - data_dict['gt'].nan_to_num()) ** 2
             g_loss = g_l2_loss_rel
             g_loss *= loss_mask
             g_loss = g_loss.mean()
@@ -109,7 +109,7 @@ class socialLSTM(ModelTemplate):
             )
         self.optimizer_g.step()
         
-        return {"g_loss": g_loss.item()}
+        return {"loss": g_loss.item()}
 
     def save(self, epoch: int = 0, path: Path=None) -> None:
         if path is None:
