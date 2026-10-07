@@ -72,8 +72,8 @@ class MID(ModelTemplate):
         
         for i in range(len(agent_type)):
             for edge_type in neighbors.keys():
-                if AgentType[edge_type[0]].value == agent_type[i]:
-                    idx = torch.where(neighbor_type[i] == AgentType[edge_type[1]].value)
+                if AgentType[edge_type[0].name] == agent_type[i]:
+                    idx = torch.where(neighbor_type[i] == AgentType[edge_type[1].name])
                 else:
                     idx = []
                 
@@ -95,13 +95,13 @@ class MID(ModelTemplate):
     def predict(self, data_dict, return_prob=False):
         batch = self.create_batch(data_dict)
         
-        n_sample = 10000 if return_prob else 20
+        n_sample = self.kde_n_sample if return_prob else 20
         
         node_type = str(AgentType(data_dict['agent_type'][0].item())).lstrip('AgentType.')  # assume all agnet types are the same in this minibatch
-        traj_pred = self.model.generate(batch, node_type, num_points=12, sample=n_sample, bestof=True, step=1)
+        traj_pred = self.model.generate(batch, node_type, num_points=12, sample=n_sample, bestof=True)
         traj_pred = traj_pred.permute(1, 0, 2, 3)
         
-        data_dict[("pred", 0)] = traj_pred
+        data_dict[("pred", 0)] = traj_pred[:, :20]
         
         if return_prob:
             traj_pred = torch.cat([traj_pred, torch.zeros_like(traj_pred)], dim=3)
@@ -170,11 +170,10 @@ class CustomAutoEncoder(AutoEncoder):
                 num_steps=100,
                 beta_T=5e-2,
                 mode='linear'
-
             )
         )
     
-    def generate(self, batch, node_type, num_points, sample, bestof,flexibility=0.0, ret_traj=False, sampling="ddpm", step=100):
+    def generate(self, batch, node_type, num_points, sample, bestof,flexibility=0.0, ret_traj=False, sampling="ddpm", step=1):
         # dynamics = self.encoder.node_models_dict[node_type].dynamic
         encoded_x = self.encoder.get_latent(batch, node_type)
         predicted_y_vel =  self.diffusion.sample(num_points, encoded_x,sample,bestof, flexibility=flexibility, ret_traj=ret_traj, sampling=sampling, step=step)
@@ -215,3 +214,46 @@ class CustomDiffusionTraj(DiffusionTraj):
         loss = (e_theta - e_rand) ** 2 
         loss *= mask
         return loss.mean()
+    
+    def sample(self, num_points, context, sample, bestof, point_dim=2, flexibility=0.0, ret_traj=False, sampling="ddpm", step=100):
+        ## original: sampling traj sequentially
+        ## changed to parallel sampling
+        traj_list = []
+        batch_size = context.size(0) * sample
+        if bestof:
+            x_T = torch.randn([batch_size, num_points, point_dim]).to(context.device)
+        else:
+            x_T = torch.zeros([batch_size, num_points, point_dim]).to(context.device)
+        traj = {self.var_sched.num_steps: x_T}
+        stride = step
+        # for t in range(self.var_sched.num_steps, 0, -1):
+        for t in range(self.var_sched.num_steps, 0, -stride):
+            z = torch.randn_like(x_T) if t > 1 else torch.zeros_like(x_T)
+            alpha = self.var_sched.alphas[t]
+            alpha_bar = self.var_sched.alpha_bars[t]
+            alpha_bar_next = self.var_sched.alpha_bars[t-stride]
+            sigma = self.var_sched.get_sigmas(t, flexibility)
+
+            c0 = 1.0 / torch.sqrt(alpha)
+            c1 = (1 - alpha) / torch.sqrt(1 - alpha_bar)
+
+            x_t = traj[t]
+            beta = self.var_sched.betas[[t]*batch_size]
+            e_theta = self.net(x_t, beta=beta, context=context.tile(sample, 1))
+            if sampling == "ddpm":
+                x_next = c0 * (x_t - c1 * e_theta) + sigma * z
+            elif sampling == "ddim":
+                x0_t = (x_t - e_theta * (1 - alpha_bar).sqrt()) / alpha_bar.sqrt()
+                x_next = alpha_bar_next.sqrt() * x0_t + (1 - alpha_bar_next).sqrt() * e_theta
+        
+            traj[t-1] = x_next.detach()     # Stop gradient and save trajectory.
+            traj[t] = traj[t].cpu()         # Move previous output to CPU memory.
+            if not ret_traj:
+                del traj[t]
+
+        if ret_traj:
+            traj_list.append(traj)
+        else:
+            traj_list.append(traj[0])
+        
+        return torch.stack(traj_list, dim=1).reshape([sample, context.size(0), num_points, point_dim])

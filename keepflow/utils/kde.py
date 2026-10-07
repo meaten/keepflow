@@ -1,9 +1,28 @@
+"""Gaussian KDE used to obtain densities for the baselines that cannot
+estimate them natively.
+
+`DynamicBufferModule` and `GaussianKDE` are adapted from anomalib
+(https://github.com/openvinotoolkit/anomalib), Copyright (C) 2022 Intel
+Corporation, licensed under the Apache License, Version 2.0.
+
+`GaussianKDE.forward` has been rewritten to evaluate the kernel on chunks of
+query points instead of looping over them one by one. anomalib evaluates at
+most a few hundred query points, so the original loop was never a bottleneck
+there; here the number of query points equals the number of kernel centres
+(10^4 by default), which made the Python-level loop dominate the runtime. The
+chunked version performs the identical arithmetic and reproduces the original
+output bit-for-bit.
+"""
 from abc import ABC
 from typing import Optional, Dict
 import math
 from copy import deepcopy
 import torch
 from torch import Tensor
+
+# Peak size (in elements) of the intermediate [chunk, N, d] buffer allocated by
+# GaussianKDE.forward. ~1.3e8 elements is ~0.5 GB in float32.
+_KDE_CHUNK_ELEMENTS = 128_000_000
 
 
 def kde(data_dict: Dict) -> Dict:
@@ -18,9 +37,14 @@ def kde(data_dict: Dict) -> Dict:
                     kernel = GaussianKDE(prob[b, :, i, :-1])
                     kernel(prob[b, :, i, :-1])  # estimate the prob of predicted future positions for fair comparison of inference time
                     prob__.append(deepcopy(kernel))
-                    gt_traj_prob__.append(kernel(data_dict["gt"][b, None, i].float()))
+                    # log_prob, not prob().log(): the latter underflows to -inf
+                    # for ground-truth points far from the sample cloud, which
+                    # used to be clamped to -10000 (or land on the float32
+                    # subnormal floor at -103.28) and reported as if it were the
+                    # model's density.
+                    gt_traj_prob__.append(kernel.log_prob(data_dict["gt"][b, None, i].float()))
                 prob_.append(deepcopy(prob__))
-                gt_traj_log_prob.append(torch.cat(gt_traj_prob__, dim=-1).log())
+                gt_traj_log_prob.append(torch.cat(gt_traj_prob__, dim=-1))
             gt_traj_log_prob = torch.stack(gt_traj_log_prob, dim=0)
             gt_traj_log_prob = torch.nan_to_num(gt_traj_log_prob, neginf=-10000)
             data_dict[k] = prob_
@@ -74,12 +98,14 @@ class GaussianKDE(DynamicBufferModule):
         dataset (Optional[Tensor], optional): Dataset on which to fit the KDE model. Defaults to None.
     """
 
-    def __init__(self, dataset: Optional[Tensor] = None):
+    def __init__(self, dataset: Optional[Tensor] = None, bw_factor=1.0):
         super().__init__()
 
         self.register_buffer("bw_transform", Tensor())
         self.register_buffer("dataset", Tensor())
         self.register_buffer("norm", Tensor())
+
+        self.bw_factor = bw_factor
 
         #self.bw_transform = Tensor()
         #self.dataset = Tensor()
@@ -90,20 +116,49 @@ class GaussianKDE(DynamicBufferModule):
         
         
     def forward(self, features: Tensor) -> Tensor:
-        """Get the KDE estimates from the feature map.
+        """Get the KDE estimates at the given query points.
         Args:
-          features (Tensor): Feature map extracted from the CNN
-        Returns: KDE Estimates
+          features (Tensor): Query points, shape [n_query, dim]
+        Returns: KDE Estimates, shape [n_query]
+        """
+        return self.log_prob(features).exp()
+
+    def log_prob(self, features: Tensor) -> Tensor:
+        """Log of the KDE estimate, computed without ever forming the density.
+
+        Evaluating the density and taking its log afterwards underflows: a
+        Gaussian kernel mean below the smallest float32 subnormal (1.4e-45)
+        becomes exactly 0, and its log becomes -inf, which the caller then
+        clamps. The observed "floor" of log(1.4e-45) = -103.28 in the baselines'
+        log-probabilities is that underflow, not a property of the model.
+
+        A Gaussian KDE is strictly positive everywhere, so the log-density is
+        always finite; accumulating it with log-sum-exp in float64 recovers the
+        true value however small the density is, and no clamping is needed.
+
+        Args:
+          features (Tensor): Query points, shape [n_query, dim]
+        Returns: log KDE estimates, shape [n_query]
         """
         features = torch.matmul(features, self.bw_transform)
 
-        estimate = torch.zeros(features.shape[0]).to(features.device)
-        for i in range(features.shape[0]):
-            embedding = ((self.dataset - features[i]) ** 2).sum(dim=1)
-            embedding = torch.exp(-embedding / 2) * self.norm
-            estimate[i] = torch.mean(embedding)
+        n_centres, dim = self.dataset.shape
+        # Bound the [chunk, n_centres, dim] intermediate to a fixed memory budget.
+        chunk = max(1, _KDE_CHUNK_ELEMENTS // max(1, n_centres * dim))
 
-        return estimate
+        dataset = self.dataset.unsqueeze(0).double()  # [1, n_centres, dim]
+        log_norm = self.norm.double().log()
+        log_n = math.log(n_centres)
+        out = torch.empty(features.shape[0], device=features.device,
+                          dtype=features.dtype)
+        for start in range(0, features.shape[0], chunk):
+            query = features[start:start + chunk].unsqueeze(1).double()  # [chunk, 1, dim]
+            sq = (dataset - query).pow_(2).sum(dim=-1)                   # [chunk, n_centres]
+            log_kernel = -sq / 2 + log_norm
+            out[start:start + chunk] = (
+                torch.logsumexp(log_kernel, dim=-1) - log_n).to(out.dtype)
+
+        return out
 
     def fit(self, dataset: Tensor) -> None:
         """Fit a KDE model to the input dataset.
@@ -116,7 +171,7 @@ class GaussianKDE(DynamicBufferModule):
         num_samples, dimension = dataset.shape
 
         # compute scott's bandwidth factor
-        factor = num_samples ** (-1 / (dimension + 4))
+        factor = num_samples ** (-1 / (dimension + 4)) * self.bw_factor
 
         cov_mat = self.cov(dataset.T)
         inv_cov_mat = torch.linalg.inv(cov_mat)

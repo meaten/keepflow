@@ -31,6 +31,8 @@ class FlowChainTraj(ModelTemplate):
         super().__init__(cfg)
         
         self.pred_state = cfg.DATA.TRAJ.PRED_STATE
+        self.update_threshold = cfg.MODEL.FLOW.UPDATE_THRESHOLD
+        self.ess_threshold = cfg.MODEL.FLOW.ESS_THRESHOLD
         
         dim_encoder = self._build_encoder(cfg)
         self._build_flow(cfg, dim_encoder)
@@ -76,28 +78,27 @@ class FlowChainTraj(ModelTemplate):
         }
         
         return model_dict
+    
+    def _build_flow_arg(self, cfg: CfgNode) -> dict:
+        return {
+            'input_size': 2,
+            'n_blocks': cfg.MODEL.FLOW.N_BLOCKS,
+            'n_hidden': cfg.MODEL.FLOW.N_HIDDEN,
+            'hidden_size': cfg.MODEL.FLOW.HIDDEN_SIZE,
+            'cond_size': cfg.MODEL.FLOW.COND_SIZE,
+            'flow_architecture': cfg.MODEL.FLOW.ARCHITECTURE,
+            'pred_len': self.pred_len,
+            'base_sigma': cfg.MODEL.FLOW.BASE_SIGMA,
+        }
 
     def _build_flow(self, cfg: CfgNode, dim_encoder: int) -> None:
         ### FlowChain Model
         model_dict = self._build_model_dict(cfg)
         
-        n_blocks = cfg.MODEL.FLOW.N_BLOCKS
-        n_hidden = cfg.MODEL.FLOW.N_HIDDEN
-        hidden_size = cfg.MODEL.FLOW.HIDDEN_SIZE
-        
+        flow_args = self._build_flow_arg(cfg)
         self.flow = nn.ModuleDict()
         for node_type in self.env.NodeType:
-            output_size = 2
-            self.flow[node_type] = model_dict[cfg.MODEL.TYPE](
-                input_size=output_size,
-                n_blocks=n_blocks,
-                n_hidden=n_hidden,
-                hidden_size=hidden_size,
-                cond_size=cfg.MODEL.FLOW.COND_SIZE,
-                flow_architecture=cfg.MODEL.FLOW.ARCHITECTURE,
-                pred_len=self.pred_len,
-                base_sigma=cfg.MODEL.FLOW.BASE_SIGMA,
-            )
+            self.flow[node_type] = model_dict[cfg.MODEL.TYPE](**flow_args)
     
     def _build_optimizer(self, cfg: CfgNode) -> None:
         self.dequantize = cfg.SOLVER.DEQUANTIZE
@@ -127,8 +128,8 @@ class FlowChainTraj(ModelTemplate):
         for i in range(len(agent_type)):
             for edge_type in neighbors.keys():
                 
-                if AgentType[edge_type[0]].value == agent_type[i]:
-                    idx = torch.where(neighbor_type[i] == AgentType[edge_type[1]].value)
+                if edge_type[0] == agent_type[i]:
+                    idx = torch.where(neighbor_type[i] == edge_type[1])
                 else:
                     idx = []
                 
@@ -177,7 +178,7 @@ class FlowChainTraj(ModelTemplate):
         
         # for update
         self.ldjs_tmp = seq_ldjs
-        self.base_prob_normalizer_tmp = base_log_prob.exp().sum(dim=1)
+        self.base_prob_normalizer_tmp = torch.logsumexp(base_log_prob, dim=1)
 
         data_dict[("prob", 0)] = torch.cat(
             [sampled_seq, log_prob[..., None]], dim=-1)
@@ -219,18 +220,37 @@ class FlowChainTraj(ModelTemplate):
         node = self.get_node_type(data_dict)
         assert 0 < time_step and time_step < self.pred_len, f"time_step for update need to be 0~{self.pred_len-1}, got {time_step}"
         assert ("prob", 0) in data_dict.keys(), "Initial prediction needed before updating"
-        
+
         data_dict[("prob", time_step)] = data_dict[(
             "prob", 0)][:, :, time_step:].clone()
         
+        deviation = torch.norm(data_dict[("prob", 0)][:, :, time_step-1, :2] - data_dict["gt"][:, time_step-1], dim=-1)
+        gt_norm = torch.norm(data_dict["gt"][:, time_step-1] - self._get_base_pos(data_dict), dim=-1)
+        if gt_norm < 0.01:
+            return data_dict
+    
+        deviation_norm = deviation / gt_norm
+        if deviation_norm.mean() > self.update_threshold:
+            return data_dict
         base_log_prob = self.flow[node].base_dist(
             data_dict["gt"][:, time_step-1], step=time_step).log_prob(data_dict[("prob", 0)][:, :, time_step-1, :2])
+            
         base_log_prob = torch.sum(base_log_prob, dim=-1)
-        base_prob = base_log_prob.exp()
-        base_log_prob = (base_prob / base_prob.sum(dim=1) * self.base_prob_normalizer_tmp).log()
+        log_sum_exp = torch.logsumexp(base_log_prob, dim=1, keepdim=True)
+        if self.ess_threshold > 0.0:
+            # Kish effective sample size of the weights that are about to be
+            # applied. The weights already exist here, so this costs one
+            # reduction and no network evaluation. Below the threshold the
+            # update would be supported by a handful of particles, so the
+            # previous forecast is kept rather than refined.
+            log_w = base_log_prob - log_sum_exp
+            ess_frac = torch.exp(-torch.logsumexp(2.0 * log_w, dim=1)) \
+                / base_log_prob.shape[1]
+            if ess_frac.mean() < self.ess_threshold:
+                return data_dict
+        base_log_prob = base_log_prob - log_sum_exp + self.base_prob_normalizer_tmp
         log_prob = base_log_prob[:, :, None] + \
-            torch.cumsum(self.ldjs_tmp[:, :, time_step:], dim=0)
-            # torch.cumsum(self.ldjs_tmp[:, :, time_step:], dim=0) / torch.cumsum(torch.ones_like(self.ldjs_tmp[:, :, time_step:]), dim=0) 
+            torch.cumsum(self.ldjs_tmp[:, :, time_step:], dim=-1) #/ torch.cumsum(torch.ones_like(self.ldjs_tmp[:, :, time_step:]), dim=2)
         data_dict[("prob", time_step)][..., -1] = log_prob
         index_ML = data_dict[("prob", time_step)][:,:, -1, -1].argmax(dim=1)[:, None, None]
         index_ML = index_ML.expand(
@@ -270,7 +290,99 @@ class FlowChainTraj(ModelTemplate):
             return data_dict["obs"][:, -1, 2:4]
         else:
             raise ValueError
-        
+
+    def analytic_log_prob(self, data_dict: Dict) -> torch.Tensor:
+        """Evaluate this model's own analytic density at the ground truth,
+        instead of the post-hoc grid-interpolation approximation used by
+        ``TrajVisualizer.prob_on_grid`` for models with no native
+        ``gt_traj_log_prob``.
+
+        This is exactly the per-step teacher-forced ``log_prob`` used by
+        ``training_step`` (and by ``scripts/compare_reported_vs_analytic_logprob.py``,
+        which established that this matches the flow's density up to floating
+        point / grid discretisation noise). It must be called BEFORE
+        ``metrics.denormalize`` mutates ``data_dict['gt']`` in place, because
+        the flow -- and therefore this log_prob -- is defined in the model's
+        own ``DATA.TRAJ.PRED_STATE`` space (``state_p`` or ``state_v``), not
+        in the denormalized world-position coordinates ``prob_on_grid``
+        otherwise works in.
+
+        Coordinate-frame note (``state_v`` models, e.g. FlowChain-NF): the
+        returned value is a log-density over *velocity*, not over position.
+        Converting it into a position-space density would require adding the
+        log-Jacobian of the velocity -> position map
+        ``x_t = x_0 + dt * cumsum(v)_t`` (``dt**2`` per step, i.e.
+        ``+2*log(dt)``, which for ``dt=0.4`` is about ``+1.83`` nats). The
+        existing grid-interpolation path
+        (``keepflow/metrics/traj/traj_metrics.py``'s ``output_to_trajectories``,
+        ``state_v`` branch) does *not* apply this correction either -- it
+        integrates the sampled particles into position space but simply
+        ``.exp()``s the untouched velocity-space log_prob attached to each
+        particle before handing it to the grid interpolator. This method
+        intentionally reproduces that same (uncorrected) convention rather
+        than "fixing" it here, so that the analytic path is a drop-in,
+        apples-to-apples replacement for the grid path -- the only quantity
+        that changes is "interpolated on a grid" vs. "evaluated exactly"; the
+        unit convention stays identical. See
+        ``202604_Neurocomputing_FlowChain-CNF/results_E11_analytic_logprob.md``
+        for the full discussion and the state_p (Jacobian == identity, so
+        unaffected) vs. state_v comparison.
+
+        Returns:
+            Tensor of shape (batch, pred_len): per-step log-probability of
+            the ground-truth future at each prediction horizon.
+        """
+        node = self.get_node_type(data_dict)
+        cond = self._encode(data_dict, node)
+        base_pos = self._get_base_pos(data_dict)
+        log_prob = self.flow[node].log_prob(base_pos, data_dict['gt'].nan_to_num(), cond)
+
+        if self.pred_state == 'state_v':
+            # Put the density in position units so that it is comparable with
+            # the state_p models and with the baselines (whose KDEs are fitted
+            # after denormalisation, and whose GMMs are already position-space).
+            # Per prediction step the map is x_n = (prefix) + dt * v_n, whose
+            # Jacobian is dt*I in 2-D, so p_x = p_v / dt**2, i.e. -2*log(dt)
+            # nats -- about +1.83 for dt = 0.4.
+            #
+            # Caveat, deliberately not "fixed" here: positions are obtained by a
+            # *cumulative* sum, while this log_prob is the per-step marginal
+            # over v_n alone. The constant below corrects the units, not that
+            # structural mismatch; see revision_plan.md.
+            dt = data_dict['dt'].reshape(-1)[0]
+            log_prob = log_prob - 2.0 * torch.log(dt)
+
+        return log_prob
+
+    def analytic_log_prob_chain(self, data_dict: Dict, start_steps) -> Dict:
+        """Chained density of the ground truth, for each number of updates.
+
+        `analytic_log_prob` propagates the base Gaussian one step from the
+        previous ground-truth position, which is the quantity the training loss
+        optimises. Eqs. (7) to (9) instead propagate a single base Gaussian from
+        the latest observed position through n transformations, which is the
+        density the particles represent and the one the KDE baselines are
+        evaluated on. This returns the latter, for the initial forecast and for
+        each update step, from one cached backward pass through the chain.
+
+        Must be called before `metrics.denormalize` mutates `data_dict['gt']`.
+        """
+        node = self.get_node_type(data_dict)
+        cond = self._encode(data_dict, node)
+        base_pos = self._get_base_pos(data_dict)
+        gt = data_dict['gt'].nan_to_num()
+        flow = self.flow[node]
+        cache = flow.chain_preimages(gt, cond)
+        base_positions = torch.cat([base_pos[:, None], gt[:, :-1]], dim=1)
+        out = {}
+        for k in start_steps:
+            lp = flow.log_prob_chain(base_positions, cache, start_step=k)
+            if self.pred_state == 'state_v':
+                dt = data_dict['dt'].reshape(-1)[0]
+                lp = lp - 2.0 * torch.log(dt)
+            out[k] = lp.detach()
+        return out
+
     def save(self, epoch: int = 0, path: Path=None) -> None:
         if path is None:
             path = self.model_path
@@ -358,8 +470,37 @@ class FlowChain(nn.Module):
         seq_log_det_jacobians = torch.stack(seq_log_det_jacobians, dim=2)
         seq_log_det_jacobians_cumsum = torch.cumsum(
             seq_log_det_jacobians, dim=2)
-        # seq_log_det_jacobians_cumsum /= torch.cumsum(torch.ones_like(seq_log_det_jacobians_cumsum), dim=2)
+        seq_log_det_jacobians_cumsum /= torch.cumsum(torch.ones_like(seq_log_det_jacobians_cumsum), dim=2)
         return seq, seq_log_det_jacobians_cumsum, seq_log_det_jacobians
+
+    def chain_preimages(self, seq, cond, n_draws=1):
+        raise NotImplementedError(
+            "implemented for the CNF chain; the discrete FlowChain would need its "
+            "per-step nets applied in reverse here")
+
+    def log_prob_chain(self, base_positions, cache, start_step=0):
+        """Density of the ground truth after `start_step` updates.
+
+        base_positions[:, k] is the position the base Gaussian is centred on once
+        k observations have arrived: the latest observed position, which for k=0
+        is the position at time t and for k>0 the observation at t+k. Steps before
+        start_step are not defined and come back as NaN.
+        """
+        preimages, ldj_cum, cif_correction = cache
+        out = []
+        for n in range(self.pred_len):
+            if n < start_step:
+                out.append(torch.full_like(ldj_cum[:, n, 0], float("nan")))
+                continue
+            z = preimages[:, n, start_step]
+            lp = self.base_dist(base_positions[:, start_step],
+                                step=start_step).log_prob(z).sum(dim=-1)
+            lp = lp - ldj_cum[:, n, start_step]
+            if cif_correction is not None:
+                # Same normalisation as `inverse`, which produces the particles.
+                lp = lp + cif_correction / (n - start_step + 1)
+            out.append(lp)
+        return torch.stack(out, dim=1)
 
     def log_prob(self, base_pos, seq, cond):
         return self.log_prob_separate(base_pos, seq, cond)
@@ -388,7 +529,8 @@ class FlowChain(nn.Module):
         sample, seq_ldjs_cumsum, seq_ldjs = self.inverse(base_pos_sample, cond)
         base_log_prob = self.base_dist(base_pos).log_prob(base_pos_sample)
         base_log_prob = base_log_prob.sum(dim=-1)[..., None]
-        return sample, base_log_prob + seq_ldjs_cumsum, seq_ldjs, base_log_prob
+        log_prob = base_log_prob + seq_ldjs_cumsum # / torch.cumsum(torch.ones_like(seq_ldjs_cumsum), dim=2)
+        return sample, log_prob, seq_ldjs, base_log_prob
         # return sample, base_log_prob.tile([1, 1, 12]), seq_ldjs, base_log_prob
 
 
@@ -424,11 +566,43 @@ class FlowChain_separate(FlowChain):
         seq_log_det_jacobians = torch.stack(seq_log_det_jacobians, dim=2)
         seq_log_det_jacobians_cumsum = torch.cumsum(
             seq_log_det_jacobians, dim=2)
-        # seq_log_det_jacobians_cumsum /= torch.cumsum(torch.ones_like(seq_log_det_jacobians_cumsum), dim=2)
+        seq_log_det_jacobians_cumsum /= torch.cumsum(torch.ones_like(seq_log_det_jacobians_cumsum), dim=2)
         return seq, seq_log_det_jacobians_cumsum, seq_log_det_jacobians
 
 
 class FlowChain_separate_cond(FlowChain_separate):
+    def chain_preimages(self, seq, cond, n_draws=1):
+        """End-to-end backward chain for the discrete FlowChain.
+
+        For each queried step the ground truth is taken all the way back through
+        the chain, applying the per-step nets in reverse and accumulating their
+        log-det-Jacobians, so the density at step n is a single base Gaussian
+        pushed through n transformations rather than a product of per-step terms
+        evaluated at the ground truth of each step. Each net is conditioned on
+        the ground-truth prefix, as `forward_separate` conditions it.
+
+        The CIF latent is drawn inside every `CIF_step` call, as it is everywhere
+        else in this model, so an evaluation of all T steps draws O(T^2/2) of
+        them and the result carries the corresponding variance. `n_draws`
+        averages whole passes if that variance needs reducing.
+        """
+        B, T, dim = seq.shape
+        seq_cond = seq.reshape(B, T * self.input_size)
+        preimages = seq.new_zeros(B, T, T, dim)
+        ldj_cum = seq.new_zeros(B, T, T)
+        for _ in range(n_draws):
+            for n in range(T):
+                pos = seq[:, n]
+                acc = seq.new_zeros(B)
+                for m in range(n, -1, -1):
+                    cond_cat = torch.cat(
+                        [cond, seq_cond[:, :m * self.input_size]], dim=-1)
+                    pos, ldj = self.net[m](pos, cond_cat)
+                    acc = acc + ldj
+                    preimages[:, n, m] += pos / n_draws
+                    ldj_cum[:, n, m] += acc / n_draws
+        return preimages, ldj_cum, None
+
     def build_net(self, n_blocks, input_size, hidden_size, n_hidden, cond_size, **kwargs):
         flow_key = kwargs['flow_architecture']
         # increase cond_label_size for conditioning trajectory
@@ -471,8 +645,7 @@ class FlowChain_separate_cond(FlowChain_separate):
             seq_log_det_jacobians.append(log_det_jacobian)
         seq = torch.stack(seq, dim=2)
         seq_log_det_jacobians = torch.stack(seq_log_det_jacobians, dim=2)
-        seq_log_det_jacobians_cumsum = torch.cumsum(
-            seq_log_det_jacobians, dim=2)
+        seq_log_det_jacobians_cumsum = torch.cumsum(seq_log_det_jacobians, dim=2)
         seq_log_det_jacobians_cumsum /= torch.cumsum(torch.ones_like(seq_log_det_jacobians_cumsum), dim=2)
         
         return seq, seq_log_det_jacobians_cumsum, seq_log_det_jacobians
@@ -526,6 +699,7 @@ def create_MAF_step(n_blocks,
         modules += batch_norm * [BatchNorm(input_size)]
 
     return FlowSequential(*modules)
+
 
 
 class DiagonalGaussianConditionalDensity(nn.Module):
@@ -674,6 +848,8 @@ class CIF_step(nn.Module):
         log_r_u = self.r_u_given_x.log_prob(u, torch.cat([x, y], dim=-1))
         
         return x, log_det_jac + log_q_u - log_r_u
+        # return x, log_det_jac - log_q_u + log_r_u
+
 
 
 class FlowChain_CIF(FlowChain):

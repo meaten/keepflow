@@ -30,7 +30,7 @@ class Trajectron(ModelTemplate):
         hyperparams['edge_influence_combine_method'] = 'attention'
         hyperparams['edge_addition_filter'] = [0.25, 0.5, 0.75, 1.0]
         hyperparams['edge_removal_filter'] = [1.0, 0.0]
-        hyperparams['batch_size'] = cfg.DATA.BATCH_SIZE
+        hyperparams['batch_size'] = cfg.SOLVER.BATCH_SIZE
         hyperparams['k_eval'] = 20
         hyperparams['offline_scene_graph'] = 'no'
         hyperparams['incl_robot_node'] = False
@@ -48,6 +48,8 @@ class Trajectron(ModelTemplate):
 
         self.curr_iter = 0
         self.ph = self.hyperparams['prediction_horizon']
+
+        self.pred_state = self.hyperparams['pred_state']
 
         env = EmptyEnv(cfg)
                 
@@ -74,7 +76,7 @@ class Trajectron(ModelTemplate):
 
         self.node_models_dict.clear()
         edge_types = env.get_edge_types()
-
+        
         for node_type in env.PredNodeType:
             self.node_models_dict[node_type] = CustomMultimodalGenerativeCVAE(env,
                                                                             node_type,
@@ -132,8 +134,8 @@ class Trajectron(ModelTemplate):
         
         for i in range(len(agent_type)):
             for edge_type in neighbors.keys():
-                if AgentType[edge_type[0]].value == agent_type[i]:
-                    idx = torch.where(neighbor_type[i] == AgentType[edge_type[1]].value)
+                if edge_type[0] == agent_type[i]:
+                    idx = torch.where(neighbor_type[i] == edge_type[1])
                 else:
                     idx = []
                 
@@ -152,7 +154,7 @@ class Trajectron(ModelTemplate):
         
         return batch
     
-    def predict(self, data_dict, return_prob=False):
+    def predict(self, data_dict, return_prob=False, n_sample=20):
         batch = self.create_batch(data_dict)
         (first_history_index,
          x_t, y_t, x_st_t, y_st_t,
@@ -171,18 +173,20 @@ class Trajectron(ModelTemplate):
                                     robot=robot_traj_st_t,
                                     map=map,
                                     prediction_horizon=self.pred_len,
-                                    num_samples=1,
+                                    num_samples=n_sample,
                                     z_mode=False,
                                     gmm_mode=False,  # if sampling z from mean distribution # True for simfork
                                     full_dist=True,  # if sampling from all latent modes
                                     all_z_sep=False)
         
-        data_dict[("pred", 0)] = predictions[0]
+        data_dict[("pred", 0)] = predictions.transpose(0, 1)
         if return_prob:
-            data_dict[("gt_traj_log_prob", 0)] = y_dist.log_prob(data_dict["gt"]).squeeze(1)
             y_dist = model.dynamic.integrate_distribution(y_dist)
             data_dict[("prob", 0)] = y_dist
             y_dist.log_prob(torch.rand_like(predictions).tile(1, 10000, 1, 1))  # calculate the probability for the fair comparison on inference cost
+
+            log_prob_each = y_dist.log_prob(model.dynamic.integrate_samples(data_dict["gt"]))
+            data_dict[("gt_traj_log_prob", 0)] = torch.logsumexp(log_prob_each + torch.log(torch.Tensor([1 / log_prob_each.shape[0]]).to(log_prob_each.device)), dim=0)
         return data_dict
     
     def training_step(self, data_dict):

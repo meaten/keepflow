@@ -51,27 +51,51 @@ class socialLSTM(ModelTemplate):
         self.clipping_threshold_g = 1.5
         self.l2_loss_weight = 1.0
 
-        self.pos_idx = [0, 1]
-        self.vel_idx = [2, 3]
 
-    def predict(self, data_dict: Dict, return_prob=False, n_sample=20) -> Dict:
-        obs_slstm, obs_slstm_rel, seq_start_end_slstm = self.data_dict_to_slstm(data_dict)
+    def predict(self, data_dict: Dict, return_prob=False) -> Dict:
+        obs_slstm, obs_slstm_rel, gt_slstm, gt_slstm_rel, loss_mask, seq_start_end_slstm = self.data_dict_to_slstm(data_dict)
         
-        pred = []
-        for _ in range(n_sample):
-            pred_traj_fake_rel = self.g.forward(obs_slstm.permute(1, 0, 2).contiguous(),
-                                            obs_slstm_rel.permute(1, 0, 2).contiguous(),
-                                            seq_start_end_slstm)
-            pred_traj_fake_rel = pred_traj_fake_rel.permute(1, 0, 2)[seq_start_end_slstm[:, 0]]
-            pred.append(pred_traj_fake_rel)
-        pred = torch.stack(pred, dim=1)
-        data_dict[("pred", 0)] = pred
+        n_sample = self.kde_n_sample if return_prob else 20
+
+        # pred = []
+        # for _ in range(n_sample):
+        #     pred_traj_fake_rel = self.g.forward(obs_slstm,
+        #                                     obs_slstm_rel,
+        #                                     seq_start_end_slstm)
+        #     pred_traj_fake_rel = pred_traj_fake_rel.permute(1, 0, 2)[seq_start_end_slstm[:, 0]]
+        #     pred_traj_fake = relative_to_abs(pred_traj_fake_rel, data_dict['obs'][:, -1])
+        #     pred.append(pred_traj_fake)
+        # pred = torch.stack(pred, dim=1)
+        # data_dict[("pred", 0)] = pred[:, :20]
+        pred_traj_fake_rel = self.g.forward(
+            obs_slstm,
+            obs_slstm_rel,
+            seq_start_end_slstm,
+            n_sample=n_sample
+        )
+
+        max_val = torch.max(seq_start_end_slstm)
+        tiled_start_end = seq_start_end_slstm.repeat(n_sample, 1)
+        offsets = torch.arange(n_sample).repeat_interleave(len(seq_start_end_slstm)) * max_val
+        seq_start_end = tiled_start_end + offsets[:, None]
+
+        pred_traj_fake_rel = pred_traj_fake_rel.permute(1, 0, 2)[seq_start_end[:, 0]]
+        pred_traj_fake = relative_to_abs(pred_traj_fake_rel, data_dict['obs'][:, -1].repeat(n_sample, 1))
+        pred = pred_traj_fake.reshape([-1, n_sample, self.pred_len, 2])
+        data_dict[("pred", 0)] = pred[:, :20]
+
+        if return_prob:
+            traj_pred = pred
+            traj_pred = torch.cat([traj_pred, torch.zeros_like(traj_pred)], dim=3)
+            data_dict[("prob", 0)] = traj_pred[..., :3]
+            
         return data_dict
 
     def data_dict_to_slstm(self, data_dict):
         bs, t, _ = data_dict["obs"].shape
         obs = data_dict['obs']
         neighbors = data_dict["neighbors"]
+        neighbors_gt = data_dict["neighbors_gt"]
         neighbor_type = data_dict['neighbor_type']
 
         seq_end = torch.arange(bs) + torch.cumsum(torch.LongTensor([len(n[nt != -1]) for n, nt in zip(neighbors, neighbor_type)]), dim=0) + 1
@@ -84,13 +108,32 @@ class socialLSTM(ModelTemplate):
             list_o_n.append(n[nt != -1])
         
         obs_slstm = torch.concat(list_o_n, dim=0).nan_to_num()
-        
-        assert torch.all(obs_slstm[seq_start_end_slstm[:, 0]] == data_dict["obs"])
-        obs_slstm_rel = obs_slstm[..., self.vel_idx]
-        obs_slstm = obs_slstm[..., self.pos_idx]
-        
-        return obs_slstm, obs_slstm_rel, seq_start_end_slstm
+        obs_slstm_rel = torch.zeros_like(obs_slstm).cuda()
+        obs_slstm_rel[:, 1:] = obs_slstm[:, 1:] - obs_slstm[:, :-1]
 
+        list_o_n = []
+        for o, n, nt in zip(data_dict["gt"], neighbors_gt, neighbor_type):
+            list_o_n.append(o[None])
+            list_o_n.append(n[nt != -1])
+        
+        gt_slstm = torch.concat(list_o_n, dim=0).nan_to_num()
+        gt_slstm_rel = gt_slstm - torch.cat([obs_slstm[:, -1][:, None], gt_slstm[:, :-1]], dim=1)
+
+        assert torch.all(obs_slstm[seq_start_end_slstm[:, 0]] == data_dict["obs"])
+        assert torch.all(gt_slstm[seq_start_end_slstm[:, 0]] == data_dict["gt"])
+
+        loss_mask = ~torch.isnan(torch.cat([obs_slstm, gt_slstm], dim=1)[..., 0])
+        
+        return (
+            obs_slstm.permute(1, 0, 2).contiguous(),
+            obs_slstm_rel.permute(1, 0, 2).contiguous(),
+            gt_slstm.permute(1, 0, 2).contiguous(),
+            gt_slstm_rel.permute(1, 0, 2).contiguous(),
+            loss_mask,
+            seq_start_end_slstm
+        )
+    
+    
     def training_step(self, data_dict: Dict) -> Dict:
         g_loss = 0
         
@@ -158,7 +201,73 @@ class CustomTrajectoryGenerator(TrajectoryGenerator):
                 grid_size=grid_size,
                 device=device
             )
+    
+    def forward(self, obs_traj, obs_traj_rel, seq_start_end, user_noise=None, n_sample=None):
+        """
+        Inputs:
+        - obs_traj: Tensor of shape (obs_len, batch, 2)
+        - obs_traj_rel: Tensor of shape (obs_len, batch, 2)
+        - seq_start_end: A list of tuples which delimit sequences within batch.
+        - user_noise: Generally used for inference when you want to see
+        relation between different types of noise and outputs.
+        Output:
+        - pred_traj_rel: Tensor of shape (self.pred_len, batch, 2)
+        """
+        batch = obs_traj_rel.size(1)
+        # Encode seq
+        final_encoder_h = self.encoder(obs_traj_rel)
+        # Pool States
+        if self.pooling_type:
+            end_pos = obs_traj[-1, :, :]
+            pool_h = self.pool_net(final_encoder_h, seq_start_end, end_pos)
+        
+            # Construct input hidden states for decoder
+            mlp_decoder_context_input = torch.cat(
+                [final_encoder_h.view(-1, self.encoder_h_dim), pool_h], dim=1)
+        else:
+            mlp_decoder_context_input = final_encoder_h.view(
+                -1, self.encoder_h_dim)
 
+        # Add Noise
+        if self.mlp_decoder_needed():
+            noise_input = self.mlp_decoder_context(mlp_decoder_context_input)
+        else:
+            noise_input = mlp_decoder_context_input
+        
+        if n_sample is not None:
+            noise_input = noise_input.tile(n_sample, 1)
+            # seq_start_end = seq_start_end.tile(n_sample, 1).flatten().cumsum(dim=0).reshape(-1,2)
+            max_val = torch.max(seq_start_end)
+            tiled_start_end = seq_start_end.repeat(n_sample, 1)
+            offsets = torch.arange(n_sample).repeat_interleave(len(seq_start_end)) * max_val
+            seq_start_end = tiled_start_end + offsets[:, None]
+            batch *= n_sample
+            obs_traj = obs_traj.tile(1, n_sample, 1)
+            obs_traj_rel = obs_traj_rel.tile(1, n_sample, 1)            
+        
+        decoder_h = self.add_noise(
+            noise_input, seq_start_end, user_noise=user_noise)
+        decoder_h = torch.unsqueeze(decoder_h, 0)
+
+        decoder_c = torch.zeros(
+            self.num_layers, batch, self.decoder_h_dim
+        ).cuda()
+
+        state_tuple = (decoder_h, decoder_c)
+        last_pos = obs_traj[-1]
+        last_pos_rel = obs_traj_rel[-1]
+        # Predict Trajectory
+
+        decoder_out = self.decoder(
+            last_pos,
+            last_pos_rel,
+            state_tuple,
+            seq_start_end,
+        )
+        pred_traj_fake_rel, final_decoder_h = decoder_out
+
+        return pred_traj_fake_rel
+    
 class CustomSocialPooling(SocialPooling):
     def __init__(
         self, h_dim=64, activation='relu', batch_norm=True, dropout=0.0,
@@ -235,3 +344,17 @@ class CustomSocialPooling(SocialPooling):
         pool_h = self.mlp_pool(pool_h)
         return pool_h
 
+
+def relative_to_abs(rel_traj, start_pos):
+    """
+    Inputs:
+    - rel_traj: pytorch tensor of shape (seq_len, batch, 2)
+    - start_pos: pytorch tensor of shape (batch, 2)
+    Outputs:
+    - abs_traj: pytorch tensor of shape (seq_len, batch, 2)
+    """
+    # batch, seq_len, 2
+    displacement = torch.cumsum(rel_traj, dim=1)
+    start_pos = torch.unsqueeze(start_pos, dim=1)
+    abs_traj = displacement + start_pos
+    return abs_traj

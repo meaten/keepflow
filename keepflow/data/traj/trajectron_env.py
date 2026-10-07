@@ -8,7 +8,10 @@ class EmptyEnv():
         params = load_params(cfg)
         self.PredNodeType = [str(a).lstrip('AgentType.') for a in params['only_predict_list']]
         self.NodeType = [str(a).lstrip('AgentType.') for a in params['agent_list']]
-        self.EdgeType = list(itertools.product(self.PredNodeType, self.NodeType))
+        # self.EdgeType = list(itertools.product(self.PredNodeType, self.NodeType))
+        self.EdgeType = []
+        for n1, n2 in itertools.product(self.PredNodeType, self.NodeType):
+            self.EdgeType.append((AgentType[n1], AgentType[n2]))
         self.scenes = [EmptyScene(params['desired_dt'])]
     def get_edge_types(self):
         return self.EdgeType

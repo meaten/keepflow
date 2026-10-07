@@ -36,6 +36,12 @@ class ModelTemplate(nn.Module):
 
         self.obs_len = cfg.DATA.OBSERVE_LENGTH
         self.pred_len = cfg.DATA.PREDICT_LENGTH
+
+        # Number of trajectory samples drawn when a density is requested
+        # (return_prob=True). For the baselines these samples are the input to
+        # the post-hoc KDE, so this is the "sample budget" swept in the
+        # accuracy-runtime analysis.
+        self.kde_n_sample = cfg.TEST.KDE_N_SAMPLE
         
     @abstractmethod
     def training_step(self, data_dict) -> None:

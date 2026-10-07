@@ -1,11 +1,9 @@
 import sys
 from typing import Dict, List
 from yacs.config import CfgNode
-from pathlib import Path
 from tqdm import tqdm
 import numpy as np
 import torch
-import torch.nn as nn
 import torch.optim as optim
 
 from keepflow.models import ModelTemplate
@@ -35,13 +33,28 @@ class SingularTrajectory_wo_AA(ModelTemplate):
         
         obs_traj_all = []
         gt_traj_all = []
-        loader = build_dataloader(cfg)
+        loader = build_dataloader(cfg)  # train split
         print("Loading data for Singular Space...")
         for batch in tqdm(loader):
             obs_traj_all.append(batch['obs'].clone())
             gt_traj_all.append(batch['gt'].clone())
-        self.model.calculate_parameters(torch.cat(obs_traj_all, dim=0), torch.cat(gt_traj_all, dim=0))
-
+        obs_traj_all = torch.cat(obs_traj_all, dim=0)
+        gt_traj_all = torch.cat(gt_traj_all, dim=0)
+        try:
+            self.model.calculate_parameters(obs_traj_all, gt_traj_all)
+        except ValueError:
+            # for synthesized datasets
+            g = torch.Generator(device=obs_traj_all.device)
+            g.manual_seed(123)
+            noise = torch.rand(
+                obs_traj_all.shape, 
+                generator=g, 
+                device=obs_traj_all.device, 
+                dtype=obs_traj_all.dtype
+            )
+            obs_traj_all += 2.0 * noise
+            self.model.calculate_parameters(obs_traj_all, gt_traj_all)
+            
         self.optimizer = optim.Adam(self.parameters(), lr=hyper_params.lr, weight_decay=hyper_params.weight_decay)
         self.optimizers = [self.optimizer]
 
@@ -92,9 +105,22 @@ class SingularTrajectory_wo_AA(ModelTemplate):
     
     def predict(self, data_dict: Dict, return_prob=False) -> Dict:        
         obs_traj, adaptive_anchor, pred_traj, addl_info, index = self.create_batch(data_dict)
-        if return_prob:
-            addl_info["num_samples"] = 10000
-        output = self.model(obs_traj, adaptive_anchor, pred_traj, addl_info)
+        
+        # cannot change num_samples. deterministic sampling
+        output = self.model(obs_traj, adaptive_anchor + torch.rand_like(adaptive_anchor), pred_traj, addl_info)
         
         data_dict[('pred', 0)] = output['recon_traj'][:, index].transpose(0, 1)
+        
+        if return_prob:
+            trajs = [data_dict[('pred', 0)]]
+            # num_samples trajectories per call; repeat until the sample budget is met.
+            n_repeat = max(0, -(-self.kde_n_sample // self.num_samples) - 1)
+            for _ in range(n_repeat):
+                output = self.model(obs_traj, adaptive_anchor + torch.rand_like(adaptive_anchor), pred_traj, addl_info)
+                traj_pred = output['recon_traj'][:, index].transpose(0, 1)
+                trajs.append(traj_pred)
+            trajs = torch.cat(trajs, dim=1)
+            trajs = torch.cat([trajs, torch.zeros_like(trajs)], dim=3)
+            data_dict[("prob", 0)] = trajs[..., :3]
+
         return data_dict

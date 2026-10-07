@@ -35,6 +35,14 @@ class ContinuousFlowChainTraj(FlowChainTraj):
         self.encoder.set_annealing_params()
         
         
+    def _build_flow_arg(self, cfg: CfgNode) -> dict:
+        args = super()._build_flow_arg(cfg)
+        args['cnf_solver'] = cfg.MODEL.FLOW.CNF_SOLVER
+        args['num_step'] = cfg.MODEL.FLOW.NUM_STEP
+        args['atol'] = cfg.MODEL.FLOW.CNF_ATOL
+        args['rtol'] = cfg.MODEL.FLOW.CNF_RTOL
+        return args
+
     def _build_model_dict(self, cfg: CfgNode) -> Dict:
         model_dict = {
             "ContinuousFlowChainOnestep": FlowChain_CNF,
@@ -50,7 +58,8 @@ class FlowChain_CNF(FlowChain):
         self.net = CNF_step(input_size,
                             n_hidden,
                             hidden_size,
-                            cond_size)
+                            cond_size,
+                            **solver_kwargs(kwargs))
                 
     def forward_separate(self, seq, cond):
         # seq_prev = []
@@ -66,6 +75,19 @@ class FlowChain_CNF(FlowChain):
         seq_log_det_jacobians = torch.flip(seq_log_det_jacobians, [1])
         return seq_prev, seq_log_det_jacobians
     
+    def chain_preimages(self, seq, cond, n_draws=1):
+        """Same as the CIF variant, without the latent index."""
+        T = self.pred_len
+        B, _, dim = seq.shape
+        preimages = seq.new_zeros(B, T, T, dim)
+        ldj_cum = seq.new_zeros(B, T, T)
+        for n in range(T):
+            z, ldj = self.net(seq[:, n], cond, steps=list(range(n + 1, -1, -1)))
+            for k in range(n + 1):
+                preimages[:, n, k] = z[:, n - k]
+                ldj_cum[:, n, k] = ldj[:, n - k]
+        return preimages, ldj_cum, None
+
     def inverse(self, base_pos, cond):
         seq, seq_log_det_jacobian_cumsum = self.net(base_pos, cond, steps=list(range(0, self.pred_len+1)))
         seq_log_det_jacobian = calc_diff(seq_log_det_jacobian_cumsum)
@@ -78,7 +100,8 @@ class FlowChain_CNF_CIF(FlowChain):
         self.net = CNF_step(input_size,
                             n_hidden,
                             hidden_size,
-                            cond_size)
+                            cond_size,
+                            **solver_kwargs(kwargs))
         
         self.cif = CIF_step(self.net,
                             input_size=input_size,
@@ -101,6 +124,50 @@ class FlowChain_CNF_CIF(FlowChain):
         seq_log_det_jacobians += (-log_q_u + log_r_u)[:, None] / self.pred_len
         return seq_prev, seq_log_det_jacobians
     
+    def chain_preimages(self, seq, cond, n_draws=1):
+        """Take every ground-truth position back through the whole chain.
+
+        `log_prob_separate` inverts one segment per step and scores the result
+        against a base Gaussian centred on the previous ground-truth position, so
+        it can only describe the density before any update. The fast update moves
+        the base Gaussian to a later observation and restarts the product of
+        log-det-Jacobians there, which needs the preimage of the ground truth at
+        that later step.
+
+        The transformations do not change when an observation arrives, so neither
+        do the preimages. Computing them once here lets every update be evaluated
+        by re-centring the Gaussian and re-summing cached terms, with no further
+        integration. That mirrors what the particle path does: the particles stay
+        put and only their weights change.
+
+        `n_draws` averages the stochastic trace estimate over independent draws.
+        It reduces the variance of the metric without altering the model, which
+        still uses a single draw at inference.
+
+        Returns (preimages, ldj_cum, cif_correction) where preimages[:, n, k] is
+        the preimage of seq[:, n] at step k and ldj_cum[:, n, k] the accumulated
+        log-det-Jacobian of that inversion. Entries with k > n are unused.
+        """
+        u, log_r_u = self.cif.r_u_given_x.sample(
+            torch.cat([seq[:, -1], cond], dim=-1))
+        T = self.pred_len
+        B, _, dim = seq.shape
+        preimages = seq.new_zeros(B, T, T, dim)
+        ldj_cum = seq.new_zeros(B, T, T)
+        for n in range(T):
+            zs, ls = [], []
+            for _ in range(n_draws):
+                z, ldj = self.net(seq[:, n], u, steps=list(range(n + 1, -1, -1)))
+                zs.append(z); ls.append(ldj)
+            z = torch.stack(zs).mean(0)
+            ldj = torch.stack(ls).mean(0)
+            for k in range(n + 1):
+                preimages[:, n, k] = z[:, n - k]
+                ldj_cum[:, n, k] = ldj[:, n - k]
+        log_q_u = self.cif.q_u_given_z.log_prob(
+            u, torch.cat([preimages[:, 0, 0], cond], dim=-1))
+        return preimages, ldj_cum, (log_q_u - log_r_u)
+
     def inverse(self, base_pos, cond):
         u, log_q_u = self.cif.q_u_given_z.sample(torch.cat([base_pos, cond], dim=-1))
         seq, seq_log_det_jacobians_cumsum = self.net(base_pos, u, steps=list(range(0, self.pred_len+1)))
@@ -110,14 +177,21 @@ class FlowChain_CNF_CIF(FlowChain):
         return seq, seq_log_det_jacobians_cumsum, seq_log_det_jacobians
         
 
+def solver_kwargs(kwargs):
+    """ODE solver settings from MODEL.FLOW (see ContinuousFlowChainTraj._build_flow_arg)."""
+    return {k: kwargs[k] for k in ('cnf_solver', 'num_step', 'atol', 'rtol') if k in kwargs}
+
+
 class CNF_step(nn.Module):
     def __init__(self, 
                  input_size,
                  n_hidden,
                  hidden_size,
                  cond_size,
-                #  solver='dopri5',
-                 solver='rk4',
+                 cnf_solver='dopri5',
+                 num_step=None,
+                 atol=1e-2,
+                 rtol=1e-2,
                  trace_estimator=None,
                  time_varying=True  # integrating reverse got minus timesteps
                  ):
@@ -148,19 +222,24 @@ class CNF_step(nn.Module):
             noise_dist=Normal(self.mean, self.std)
             )
         
+        solver = cnf_solver
         if solver in ['euler', 'midpoint', 'rk4']:
-            self.num_step = 10
+            # NUM_STEP solver steps per unit of time, i.e. NUM_STEP + 1 grid points.
+            assert num_step is not None, "fixed-step solvers need MODEL.FLOW.NUM_STEP"
+            self.num_step = num_step + 1
             self.nde = NeuralODE(self.vector_field,
                                  solver=solver)
             
         elif solver in ['dopri5', 'tsit5']:
+            # only the end points of each unit interval are read out
             self.num_step = 2
-            tolerance = 1e-4
             self.nde = NeuralODE(self.vector_field,
                                  sensitivity='adjoint',
                                  solver=solver,
-                                 atol=tolerance,
-                                 rtol=tolerance)
+                                 atol=atol,
+                                 rtol=rtol)
+        else:
+            raise ValueError(f"unknown CNF solver {solver}")
             
         self.nde = torch.nn.Sequential(
             Augmenter(augment_idx=1, augment_dims=1),

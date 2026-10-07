@@ -9,6 +9,10 @@ def build_traj_pred_model(cfg: CfgNode):
     elif cfg.MODEL.TYPE == 'socialLSTM':
         from .social_lstm import socialLSTM
         model = socialLSTM(cfg).to(cfg.DEVICE)
+
+    elif cfg.MODEL.TYPE == 'socialGAN':
+        from .social_gan import socialGAN
+        model = socialGAN(cfg).to(cfg.DEVICE)
             
     elif cfg.MODEL.TYPE == "ARFlow":
         from .arflow import ARFlow
@@ -18,10 +22,6 @@ def build_traj_pred_model(cfg: CfgNode):
         from .mid import MID
         model = MID(cfg)
         model.to(cfg.DEVICE)
-            
-    elif cfg.MODEL.TYPE == "LED":
-        from .led import LED
-        model = LED(cfg).to(cfg.DEVICE)
         
     elif cfg.MODEL.TYPE == "Flomo":
         from .flomo import FloMo
@@ -34,10 +34,14 @@ def build_traj_pred_model(cfg: CfgNode):
     elif cfg.MODEL.TYPE == "SingularTrajectory":
         from .sintraj_wo_aa import SingularTrajectory_wo_AA
         model = SingularTrajectory_wo_AA(cfg).to(cfg.DEVICE)
-        
-    elif "FlowChainProcess" in cfg.MODEL.TYPE:
-        from .flowchainprocess import ContinuousFlowChainProcessTraj
-        model = ContinuousFlowChainProcessTraj(cfg).to(cfg.DEVICE)
+
+    elif cfg.MODEL.TYPE == "MoFlow":
+        from .moflow import MoFlow
+        model = MoFlow(cfg).to(cfg.DEVICE)
+    
+    elif cfg.MODEL.TYPE == "MoFlow_IMLE":
+        from .moflow import MoFlow_IMLE
+        model = MoFlow_IMLE(cfg).to(cfg.DEVICE)
         
     elif "ContinuousFlowChainOnestep" in cfg.MODEL.TYPE:
         from .continuousflowchain_onestep import ContinuousFlowChainTraj
@@ -48,12 +52,9 @@ def build_traj_pred_model(cfg: CfgNode):
         model = ContinuousFlowChainTraj(cfg).to(cfg.DEVICE)
 
     elif "FlowMatchingChainOnestep" in cfg.MODEL.TYPE:
-        if cfg.MODEL.TRAJ.ENCODER_TYPE == "trajectron":
-            from .flowmatchingchain_onestep import FlowMatchingChainTraj
-            model = FlowMatchingChainTraj(cfg).to(cfg.DEVICE)
-        elif cfg.MODEL.TRAJ.ENCODER_TYPE == "social_transformer":
-            from .flowmatchingchain_onestep import FlowMatchingChainTraj_transformer
-            model = FlowMatchingChainTraj_transformer(cfg).to(cfg.DEVICE)
+        from .flowmatchingchain_onestep import FlowMatchingChainTraj
+        model = FlowMatchingChainTraj(cfg).to(cfg.DEVICE)
+
     elif "FlowMatchingChain" in cfg.MODEL.TYPE:
         from .flowmatchingchain import FlowMatchingChainTraj
         model = FlowMatchingChainTraj(cfg).to(cfg.DEVICE)
@@ -63,7 +64,7 @@ def build_traj_pred_model(cfg: CfgNode):
         model = FlowChainTraj(cfg).to(cfg.DEVICE)
     
     else:
-        raise(ValueError, f"unknown model type: {cfg.MODEL.TYPE}")
+        raise ValueError(f"unknown model type: {cfg.MODEL.TYPE}")
 
     return model
         

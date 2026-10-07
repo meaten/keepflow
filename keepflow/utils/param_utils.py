@@ -27,9 +27,10 @@ def load_config(args: argparse.Namespace, while_tuning: bool=False) -> CfgNode:
         cfg_ = load_tuned_params(args, cfg_)
         
     # for reproducibility
-    random.seed(cfg.SEED)
-    np.random.seed(cfg.SEED)
-    torch.manual_seed(cfg.SEED)
+    random.seed(cfg_.SEED)
+    np.random.seed(cfg_.SEED)
+    torch.manual_seed(cfg_.SEED)
+    torch.cuda.manual_seed_all(cfg_.SEED)
         
     # just performing 'to(device)' cannot force trajdata on the specified device
     if args.device == "cpu":
@@ -57,7 +58,7 @@ def load_tuned_params(args: argparse.Namespace, cfg: CfgNode) -> CfgNode:
     print("load hyperparameters from optuna database")
     study = optuna.load_study(storage=study_path, study_name="my_opt")
     trial_dict = study.best_trial.params
-
+    
     for key in list(trial_dict.keys()):
         if type(trial_dict[key]) == str:
             exec(f"cfg.{key} = '{trial_dict[key]}'")

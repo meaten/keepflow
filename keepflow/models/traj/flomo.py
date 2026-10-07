@@ -149,7 +149,7 @@ class FloMo(ModelTemplate):
     
     def predict(self, data_dict, return_prob=False):
         x = data_dict["obs"].nan_to_num()
-        n = 10000 if return_prob else 1
+        n = self.kde_n_sample if return_prob else 1
         traj_pred, _ = self.sample(n, x)
         # data_dict[("pred_st", 0)] = traj_pred[:, 0]
         data_dict[("pred", 0)] = traj_pred[:, 0]

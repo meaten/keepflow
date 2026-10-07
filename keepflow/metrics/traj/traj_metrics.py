@@ -26,9 +26,12 @@ class TrajMetrics(object):
     def __call__(self, result_dict: Dict) -> Dict:
         ade = displacement_error(result_dict[('pred', 0)][:, :, :self.pred_len], result_dict['gt'][:, None, :self.pred_len])
         fde = final_displacement_error(result_dict[('pred', 0)][:, :, -1], result_dict['gt'][:, None, -1])
-        # emd.append(self.emd(data_dict))
-        log_prob = self.log_prob(result_dict)
-    
+        emd = self.emd(result_dict)
+        # same prediction against the exact fork/branch posterior (sim_gt.py)
+        emd_exact = self.emd(result_dict, gt_key="gt_prob_grid_exact")
+        log_prob_mean = self.log_prob_mean_per_update(result_dict)
+        log_prob_each = self.log_prob_each_first_step(result_dict)
+        log_prob_each_update_6_ahead = self.log_prob_each_update_6_ahead(result_dict)
         ade = evaluate_helper(ade) 
         fde = evaluate_helper(fde)
 
@@ -42,12 +45,27 @@ class TrajMetrics(object):
             scale = torch.Tensor(scale).to(self.device)
             ade /= scale
             fde /= scale
-            
+        
         results_dict = {"score": ade.cpu().numpy() + fde.cpu().numpy(),
                         "ade": ade.cpu().numpy(),
                         "fde": fde.cpu().numpy()}
-        if log_prob is not None:
-            results_dict["log_prob"] = log_prob.cpu().numpy()
+        if log_prob_mean is not None:
+            results_dict["log_prob_mean"] = log_prob_mean.cpu().numpy()
+        
+        if log_prob_each is not None:
+            results_dict["log_prob_each_from_6"] = log_prob_each[:, 5:].cpu().numpy()
+            results_dict["log_prob_each_from_6_mean"] = log_prob_each[:, 5:].mean(dim=-1).cpu().numpy()
+
+        if log_prob_each_update_6_ahead is not None:
+            if len(log_prob_each_update_6_ahead[0]) > 6:
+                results_dict["log_prob_each_update_6_ahead"] = log_prob_each_update_6_ahead.cpu().numpy()
+                results_dict["log_prob_each_update_6_ahead_mean"] = log_prob_each_update_6_ahead.mean(dim=-1).cpu().numpy()
+
+        if emd is not None:
+            results_dict["emd"] = emd.cpu().numpy()
+        if emd_exact is not None:
+            results_dict["emd_exact"] = emd_exact.cpu().numpy()
+        
         return results_dict
     
     def denormalize(self, result_dict: Dict) -> Dict:
@@ -98,56 +116,83 @@ class TrajMetrics(object):
     def integrate(self, seq, dt, dim=1):
         return torch.cumsum(seq, dim=dim) * dt.view(dt.shape + (1,) * (dim + 1))
             
-    def emd(self, data_dict):
-        if ("prob", 0) not in data_dict or ("gt_prob", 0) not in data_dict:
-            return torch.Tensor([0.0])
-        
-        key = None
+    def emd(self, data_dict, gt_key="gt_prob_grid"):
+        if ("prob_grid", 0) not in data_dict or (gt_key, 0) not in data_dict:
+            return None
+
+        emd_per_step = []
         for k in data_dict.keys():
-            if k[0] == "prob":
-                key = k
-        prob = torch.Tensor(data_dict[key]).to(self.device) + 1e-12
-        prob /= prob.sum(dim=1, keepdim=True)
-        gt_prob = torch.Tensor(data_dict["gt_prob"])[:, :, key[1]:]
-        gt_prob /= gt_prob.sum(dim=1, keepdim=True)
+            if k[0] == gt_key:
+                prob = torch.Tensor(data_dict[("prob_grid", k[1])]).to(self.device) + 1e-12
+                prob /= prob.sum(dim=1, keepdim=True)
+                gt_prob = data_dict[(gt_key, k[1])].to(self.device).to(torch.float32)
+                gt_prob /= gt_prob.sum(dim=1, keepdim=True)
+                """
+                target_frame = 7
+                gt_prob = torch.Tensor(data_dict["gt_prob"])[:, :, target_frame:]
+                gt_prob /= gt_prob.sum(dim=1, keepdim=True)
+                prob = np.zeros_like(data_dict[("prob", 0)][..., target_frame:])
+                for k in data_dict.keys():
+                    if k[0] == "prob":
+                        prob[..., k[1]:] = data_dict[k][..., target_frame:]
+                prob = torch.Tensor(prob).to(self.device) + 1e-8
+                """
+                X, Y = data_dict["grid"]
+                coords = torch.Tensor(np.array([X.flatten(), Y.flatten()]).T).to(self.device)
+                coordsSqr = torch.sum(coords**2, dim=1)
+                M = coordsSqr[:, None] + coordsSqr[None, :] - 2*coords.matmul(coords.T)
+                M[M < 0] = 0
+                M = torch.sqrt(M)
+                emd = []
+                for b in range(prob.shape[0]):
+                    emd_ = []
+                    for t in range(prob.shape[-1]):
+                        # emd__ = ot.sinkhorn2(gt_prob[0, :, t], prob[0, :, t], M, 1.0 / M.median(),
+                        #                       numItermax=300, stopThr=1e-4, warn=False, method='sinkhorn_log')
+                        emd__ = ot.sinkhorn2(prob[0, :, t], gt_prob[0, :, t], M, 1.0, warn=False)
+                        # print(emd__)
+                        emd_.append(emd__)
+                    emd.append(torch.Tensor(emd_).mean(dim=-1))
+                emd = torch.Tensor(emd)
+                # print(emd)
+                emd_per_step.append(emd)
+        emd_per_step = torch.stack(emd_per_step, dim=1)
         
-        """
-        target_frame = 7
-        gt_prob = torch.Tensor(data_dict["gt_prob"])[:, :, target_frame:]
-        gt_prob /= gt_prob.sum(dim=1, keepdim=True)
-        prob = np.zeros_like(data_dict[("prob", 0)][..., target_frame:])
-        for k in data_dict.keys():
-            if k[0] == "prob":
-                prob[..., k[1]:] = data_dict[k][..., target_frame:]
-        prob = torch.Tensor(prob).to(self.device) + 1e-8
-        """
-        X, Y = data_dict["grid"]
-        coords = torch.Tensor(np.array([X.flatten(), Y.flatten()]).T).to(self.device)
-        coordsSqr = torch.sum(coords**2, dim=1)
-        M = coordsSqr[:, None] + coordsSqr[None, :] - 2*coords.matmul(coords.T)
-        M[M < 0] = 0
-        M = torch.sqrt(M)
-        emd = []
-        for b in range(prob.shape[0]):
-            emd_ = []
-            for t in range(prob.shape[-1]):
-                emd__ = ot.sinkhorn2(prob[0, :, t], gt_prob[0, :, t], M, 1.0, warn=False)
-                # print(emd__)
-                emd_.append(emd__)
-            emd.append(torch.Tensor(emd_).mean(dim=-1))
-        emd = torch.Tensor(emd)
-        # print(emd)
-        return emd
+        return emd_per_step
                 
-    def log_prob(self, data_dict):
+    def log_prob_mean_per_update(self, data_dict):
         # we assume batch_size = 1
-        if ("gt_traj_log_prob", 0) in data_dict:      
-            log_prob_per_step = []
-            for k in data_dict.keys():
-                if k[0] == "gt_traj_log_prob":
-                    log_prob_per_step.append(data_dict[k].nanmean(dim=-1))
-            log_prob_per_step = torch.stack(log_prob_per_step, dim=1)
-            return log_prob_per_step
+        if ("gt_traj_log_prob", 0) in data_dict:
+            relevant_keys = [k for k in data_dict.keys() if k[0] == "gt_traj_log_prob"]
+            relevant_keys.sort(key=lambda x: x[1])
+            
+            log_prob = []
+            for k in relevant_keys:
+                log_prob.append(data_dict[k].nanmean(dim=-1))
+            
+            log_prob = torch.stack(log_prob, dim=1)
+            return log_prob
+        else:
+            return None
+        
+    def log_prob_each_first_step(self, data_dict):
+        k = ("gt_traj_log_prob", 0) 
+        if k in data_dict:
+            return data_dict[k]
+        else:
+            return None
+        
+    def log_prob_each_update_6_ahead(self, data_dict):
+        if ("gt_traj_log_prob", 0) in data_dict:
+            relevant_keys = [k for k in data_dict.keys() if k[0] == "gt_traj_log_prob"]
+            relevant_keys.sort(key=lambda x: x[1])
+            
+            log_prob = []
+            for k in relevant_keys:
+                log_prob.append(data_dict[k][:, 5])
+            
+            log_prob = torch.stack(log_prob, dim=1)
+            return log_prob
         else:
             return None
         

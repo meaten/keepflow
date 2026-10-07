@@ -53,11 +53,16 @@ def build_traj_dataset(cfg: CfgNode, split: str) -> Tuple[Dataset, Callable] :
         cache_path = Path(cfg.DATA.PATH) / cfg.DATA.TASK / 'cache'
             
         noise_hists = NoiseHistories()
+        
+        # Standardize all data such that
+        # (1) the predicted agent's orientation at the current timestep is 0
+        # (2) all data is made relative to the predicted agent's current position 
+        # and (3) the agent's heading value is replaced with its sin, cos values. Defaults to True.
         standardize_data = True
+
+        # Make agent velocities and accelerations relative to the agent being predicted. Defaults to False.
         standardize_derivatives = False
 
-        sec_history = round((cfg.DATA.OBSERVE_LENGTH - 1) * params['desired_dt'], 1)
-        sec_future = round(cfg.DATA.PREDICT_LENGTH * params['desired_dt'], 1)
         sec_two_steps = round(2 * params['desired_dt'], 1)
         
         dataset = UnifiedDataset(
@@ -66,9 +71,9 @@ def build_traj_dataset(cfg: CfgNode, split: str) -> Tuple[Dataset, Callable] :
                 desired_data: data_dir
             },
 
-            # history_sec=(sec_two_steps, sec_history) if split == 'train' else (sec_history,) * 2,
-            history_sec=(sec_history,) * 2,
-            future_sec=(sec_future,) * 2,
+            # history_sec=params['history_sec'],
+            history_sec=(sec_two_steps, params['history_sec'][0]) if cfg.DATA.TRAJ.ACCEPT_NAN and split == 'train' else params['history_sec'],
+            future_sec=params['future_sec'],
             agent_interaction_distances=params["agent_interaction_distances"],
             only_types=params["agent_list"],
             only_predict=params["only_predict_list"],
@@ -76,7 +81,7 @@ def build_traj_dataset(cfg: CfgNode, split: str) -> Tuple[Dataset, Callable] :
             standardize_data=standardize_data,
             standardize_derivatives=standardize_derivatives,
             centric='agent',
-            augmentations=[noise_hists] if split == 'train' else None,
+            augmentations=[noise_hists] if split == 'train' and cfg.DATA.AUGMENTATION else None,
             cache_location=str(cache_path),
             incl_raster_map=cfg.DATA.TRAJ.USE_MAP,
             raster_map_params=params["raster_map_params"],
@@ -88,13 +93,14 @@ def build_traj_dataset(cfg: CfgNode, split: str) -> Tuple[Dataset, Callable] :
         from .collate_wrapper import CollateWrapper
         if cfg.DATA.DATASET_NAME == 'eth' and split == 'test':
             scale = cfg.DATA.TRAJ.SCALE * 0.6  #HACK
+            # scale = cfg.DATA.TRAJ.SCALE
         else:
             scale = cfg.DATA.TRAJ.SCALE
         seq_collate = CollateWrapper(cfg, dataset.get_collate_fn(),
                                      scale=scale,
                                      standardize_data=standardize_data,
                                      standardize_derivatives=standardize_derivatives)
-        
+    
     return dataset, seq_collate
 
 
