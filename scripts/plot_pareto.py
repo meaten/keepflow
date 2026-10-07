@@ -11,6 +11,7 @@ Numbers come from the corrected protocol: all 44 ETH agents (not the first 9,
 which are only 5 distinct pedestrians), log-sum-exp KDE (no underflow floor),
 and the analytic density for FlowChain (no grid interpolation).
 """
+import argparse
 import json
 import os
 import re
@@ -41,11 +42,27 @@ def read(path, key):
     return float(m[0]) if m else None
 
 
+def parse_args():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    p.add_argument("--exclude", nargs="*", default=[],
+                   help="baseline labels to leave out, e.g. Social-GAN")
+    p.add_argument("--cnf_logprob", type=float, default=-0.741,
+                   help="FlowChain-CNF ETH log-probability (mean over seeds)")
+    p.add_argument("--cnf_time_ms", type=float, default=195.0)
+    p.add_argument("--out", default=os.path.join(REPO, "202604_Neurocomputing_FlowChain-CNF",
+                                                  "maeda5.pdf"))
+    return p.parse_args()
+
+
 def main():
+    args = parse_args()
     fig, ax = plt.subplots(figsize=(8.8, 4.8))
     pts = []
 
     for key, label, colour, marker in BASELINES:
+        if label in args.exclude:
+            continue
         xs, ys = [], []
         for n in BUDGETS:
             f = f"{BASE}/{key}/eth/metrics_sweep2_n{n}.json"
@@ -71,7 +88,7 @@ def main():
     # autoregressive: each step is trained against a base distribution centred on
     # the previous position, so the density of a step given only the observation
     # window has no closed form and the model cannot be placed on this axis.
-    CNF_TIME_MS, CNF_LOGPROB = 195.0, -0.741   # 44 ETH agents, three seeds
+    CNF_TIME_MS, CNF_LOGPROB = args.cnf_time_ms, args.cnf_logprob   # 44 ETH agents, three seeds
     print(f"  FlowChain-CNF: {CNF_LOGPROB:+.3f} @ {CNF_TIME_MS:.0f} ms")
     ax.scatter([CNF_TIME_MS], [CNF_LOGPROB], s=210, color="black", marker="*",
                label="FlowChain-CNF (ours)", zorder=5,
@@ -97,8 +114,7 @@ def main():
               framealpha=.95, borderaxespad=0)
     fig.tight_layout()
 
-    out = os.path.join(REPO, "202604_Neurocomputing_FlowChain-CNF",
-                       "maeda5.pdf")
+    out = args.out
     os.makedirs(os.path.dirname(out), exist_ok=True)
     fig.savefig(out)
     fig.savefig(out.replace(".pdf", ".png"), dpi=170)

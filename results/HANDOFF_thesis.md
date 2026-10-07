@@ -1,6 +1,6 @@
 # 博論 Ch.3（FlowChain-CNF）への反映事項：引き継ぎ
 
-作成 2026-10-07。この文書だけで内容が分かるように書いてある（数値はすべて本文中にある）。
+作成 2026-10-07、更新 2026-10-08（Social-GAN を密度評価から全面的に外す、solver 比較の表の ETH 列を全行測り直し、Pareto の図、確認事項への回答）。この文書だけで内容が分かるように書いてある（数値はすべて本文中にある）。
 元の論文：Neurocomputing NEUCOM-D-26-08804（受理済み、論文側は修正しない）。修正は博論にだけ反映する。
 すべて既存の checkpoint で測り直したもので、学習はしていない。コードと生データは、元の PC の keepflow リポジトリのブランチ `thesis/solver-gt-fix`（未 push）にある。
 
@@ -11,7 +11,7 @@
 1. **ODE solver**：論文は DOPRI5（atol=rtol=1e-2）としているが、ETH log-prob の列（主表、更新の行、ablation の表）だけは、実装の不具合で RK4（9 ステップ）で計算されていた。Sinkhorn、計算時間、solver 比較の表は DOPRI5 で正しい。
 2. **solver 比較の表の RK4・100 の ETH（0.19）**：古い別の実行の値が残っていたもので、RK4・100 の結果ではなかった。
 3. **Fork/Branch の GT**：Sinkhorn の基準にした GMM の std が 0.09 で、生成過程（std 0.3。観測点にもノイズがあり、評価座標は最後の観測点が原点）と合っていなかった。生成過程の厳密な事後分布に置き換えた。
-4. **Social-GAN**：再現実装が公表値を再現できない（ETH の ADE/FDE が原論文より良く出る）。密度評価の表からは行ごと外す。
+4. **Social-GAN**：再現実装が公表値を再現できない（ETH の ADE/FDE が原論文より良く出る）。**密度評価からはすべて外す**（§2.4）。ADE/FDE の表は原論文からの引用なので残す。Ch.2 は ICCV の数値を維持するので触らない。
 
 **どれも結論は変わらない。**
 
@@ -48,32 +48,45 @@ ADE/FDE は論文の値のまま。
 | w/o CIFM | Failed | Failed | Failed | Failed |
 
 ### solver 比較の表
-計算時間と ETH log-prob は論文の値のまま。ただし RK4・100 の ETH は 0.19 → 0.95。Fork は新しい GT。
+計算時間は論文の値のまま。Fork と ETH log-prob は、どちらも全行を今の評価コードで測り直した値にそろえる（新旧の測定は混ぜない）。
 
 | Solver | #step | Time | Fork | ETH log-prob |
 |---|---|---|---|---|
-| Dormand–Prince 5 | – | 263.1 | 1.41 | 0.93 |
-| Tsitouras 5 | – | 505.6 | 1.41 | 0.97 |
-| Euler | 1 | 45.5 | 1.93 | 0.81 |
-| | 10 | 383.7 | 1.49 | 0.91 |
+| Dormand–Prince 5 | – | 263.1 | 1.41 | 0.95 |
+| Tsitouras 5 | – | 505.6 | 1.41 | 0.95 |
+| Euler | 1 | 45.5 | 1.93 | 0.78 |
+| | 10 | 383.7 | 1.49 | 0.94 |
 | | 100 | 3770.4 | 1.42 | 0.95 |
-| Runge–Kutta 4 | 1 | 146.02 | 1.62 | 0.63 |
-| | 10 | 1408.1 | 1.33 | 0.97 |
+| Runge–Kutta 4 | 1 | 146.02 | 1.62 | 0.64 |
+| | 10 | 1408.1 | 1.33 | 0.88 |
 | | 100 | 15153.7 | 1.38 | 0.95 |
 
-注意：この表の ETH log-prob はグリッドを使った評価で、評価コードが論文以降に少し変わっているため、測り直すと ±0.1 程度ずれる（DOPRI5 0.95、RK4・10 0.88）。RK4・100 の 0.95 もこの誤差を含む。
+参考（論文の ETH log-prob）：0.93 / 0.97 / 0.81 / 0.91 / 0.95 / 0.63 / 0.97 / 0.19。RK4・100 の 0.19 は、別条件の古い実行の値が残っていたもの。
+結論は同じ：DOPRI5 は最良の精度（0.95）に並び、同じ精度の Euler・100 や RK4・100 より桁違いに速い。
+この表の ETH log-prob はグリッドを使った評価で、主表の ETH log-prob（解析密度）とは物差しが違う（論文のキャプションどおり）。
+
+### 2.4 Social-GAN を外す範囲（すべての密度評価）
+- 主表：行を削除（§2 の主表は削除済み）
+- KDE の予算を振った表：Social-GAN の行を削除。残りの値は変わらない（MID −1.656 / −0.915 / −0.816 / −0.955、SingularTrajectory −1.132 / −1.045 / −1.108 / −1.359、MoFlow −1.225 / −1.430 / −2.171 / −3.946。N = 20 / 100 / 10^3 / 10^4）
+- six-step-ahead の更新の表：Social-GAN の行を削除。残りの値は変わらない（この表は dopri5 で計算済み。§5.1）
+- Pareto の図：差し替える（`results/figures/pareto_thesis.pdf`。Social-GAN を外し、CNF を −0.770 にしたもの）。CNF が全手法中で最も精度が高い点であること、Pareto front が SingularTrajectory の 2 点と CNF であることは変わらない
+- 本文：Social-GAN の密度評価・KDE の計算時間に触れている箇所は、すべて削除するか MID / MoFlow の値で書き直す
+- Ch.1 の動機の節の「Social-GAN は KDE に 1,167 ms」→ 同じ主表の値で、例えば「MID は 23,534 ms、MoFlow は 39,596 ms（N = 10^4）」
+- 主表のキャプションの注記（§4）は「密度評価から外した」とする
 
 ## 3. 結論（変わらないことの確認）
 - Fork は CNF が最良。Branch は MID が最良で CNF が 2 位（論文と同じ）。ETH log-prob は CNF が最良。
-- GT を替えても、手法の順位は Fork・Branch とも変わらない。
+- 3 桁の値（新しい GT）：Fork は CNF 1.408 < NF 1.718 < MID 1.721 < Trajectron++ 1.968 < MoFlow 3.804 < SingularTrajectory 5.341。Branch は MID 0.892 < CNF 1.266 < NF 1.530 < Trajectron++ 1.701 < MoFlow 3.160 < SingularTrajectory 4.571。
+- **NF と MID の Fork の差は 0.003 で、9 ケースの評価のばらつきの範囲内**。「NF と MID は Fork で同程度」と書く。「順位が保たれる」は CNF の位置（Fork 1 位、Branch 2 位）についてだけ使う。
 - **更新の効果は、新しい GT の方がはっきりする**。論文では Branch の t+1 が Pred at t より悪かったが、新しい GT では t+1・t+3・t+5 のすべてで Pred at t より良い。
 - ablation：Fork は w/o CIF、Branch と ETH は full が最良（論文と同じ）。
 - solver：DOPRI5 が精度と速度の釣り合いで最良、という結論は同じ。
+- ETH log-prob の差し替えで、CNF が MID の最良予算（N=1000、−0.816）を上回る幅は 0.075 → 0.046 nats。
 
 ## 4. 本文の修正
 - 「MID の最良予算を 0.075 nats 上回る」→ **0.046 nats**（優位は保たれる）。
 - 主表のキャプションに追加（Social-GAN を外した理由）：
-  > Social-GAN is omitted from this table because our re-implementation did not reproduce its published results; its trajectory accuracy is quoted from the original paper.
+  > Social-GAN is omitted from all density evaluations because our re-implementation did not reproduce its published results; its trajectory accuracy is quoted from the original paper.
 - 付録（評価プロトコル）の GT と solver の記述を差し替え：
   > For the Fork and Branch subsets, the ground-truth density is the exact posterior of the generating process given the observed window: a Gaussian mixture over the branches whose covariance accounts for the noise shared through the last observed position. For the update rows it is further conditioned on the revealed future positions. Log-probabilities of FlowChain-CNF are evaluated with the Dormand–Prince 5 solver.
 - 付録の「基底分布の分散 σ² は log 空間で最適化される」は、FlowChain-CNF については誤り。flow matching の目的関数が σ に勾配を流さないため、初期値（実データ 0.1、unicycle 0.03）のまま固定される。博論では「固定」と書く。
@@ -134,8 +147,13 @@ CNF の符号付き誤差の 95% CI：ETH [−0.030, +0.050]、Hotel [−0.024, 
 ### 要旨の文案
 > FlowChain-CNF の予測密度は実データで過信を示さず（ECE 0.016–0.067）、全データセットで Trajectron++ より calibrated だった。誤差は初期ステップに集中し、その向きは固定された基底分散と整合する。高速更新は ESS/N ≥ 0.05 では oracle と同程度に calibrated で、ESS/N < 0.05 では過信に転じる（符号付き誤差 −0.13）。
 
-## 6. 図（元の PC の `results/calib_dopri5/` にある）
-- `reliability.pdf`：データセットごとの reliability diagram（CNF、NF、Trajectron++、検証用 GT）
-- `cnf_step_ece.pdf`：CNF のステップごとの ECE と符号付き誤差
-- `update_reliability_ess.pdf` / `update_reliability_strata.pdf`：更新経路の ESS 別、strata 別
-- `pit_hist.pdf`：u のヒストグラム
+### 5.1 solver の確認（どの実験が RK4 の影響を受けたか）
+- RK4 で計算されていたのは、主表の ETH log-prob（Pred at t と更新 3 行）と ablation の表の ETH 列だけ（どちらも §2 で dopri5 に差し替え済み）。
+- 更新の妥当性の検証（900 レコードの strata の表、ESS の帯の表、ESS の図）は 2026-08-08 の実行で、solver の設定が消える（2026-08-10）前なので dopri5。測り直し不要。
+- six-step-ahead の更新の表は 2026-02-17 の実行で dopri5。測り直し不要。
+- Pareto の図の CNF の点は −0.741（RK4）が直接書き込まれていたので、−0.770 にして描き直した（§2.4）。
+
+## 6. 図
+差し替える図。push したブランチ `thesis/calibration-gt-fix` の次の場所にある。
+- calibration：`results/calib_dopri5/` の `reliability.pdf`、`cnf_step_ece.pdf`、`update_reliability_ess.pdf`、`update_reliability_strata.pdf`、`pit_hist.pdf`（今の `gfx/flowchain-cnf_reliability.pdf` などは RK4 版なので、すべて差し替える）
+- Pareto：`results/figures/pareto_thesis.pdf`
